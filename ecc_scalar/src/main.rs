@@ -43,7 +43,6 @@ fn bench_ed25519_only_mul(n: usize) -> Result<()> {
 
     println!("== Ed25519 pure fixed-base scalar mul ({} iters) ==", n);
 
-    // 1) 预生成随机标量数组（不在计时段内）
     let mut rng = rand::thread_rng();
     let mut scalars_bytes: Vec<[u8; 32]> = Vec::with_capacity(n);
     for _ in 0..n {
@@ -60,7 +59,7 @@ fn bench_ed25519_only_mul(n: usize) -> Result<()> {
         std::hint::black_box(&_p);
     }
 
-    // 3) timed loop (仅乘法)
+    // 3) timed loop 
     let mut samples = Vec::with_capacity(n);
     for i in 0..n {
         let s = &scalars[i];
