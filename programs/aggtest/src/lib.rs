@@ -29,7 +29,7 @@ pub enum AggIx {
         root: [u8; 32],
         threshold: u64,
     },
-    // 由协调者写入聚合 R 与挑战 c
+    
     SetNonceAndChallenge {
         r_agg: [u8; 32],
         c: [u8; 32],
@@ -80,7 +80,7 @@ pub struct Proposal {
     pub zk_hash: [u8; 32],
     pub root: [u8; 32],
     pub threshold: u64,
-    // 审计/一致性
+    
     pub r_agg: [u8; 32],
     pub c: [u8; 32],
 }
@@ -227,7 +227,7 @@ fn set_nonce_and_challenge(
 }
 
 fn extract_pk_R_msg_with_expected<'a>(d: &'a [u8], expected_pk: &[u8; 32]) -> Result<([u8; 32], [u8;32], &'a [u8]), ProgramError> {
-    // 正常编码（new_ed25519_instruction_with_signature）
+    
     if d.len() >= 1 + 3 + 14 && d[0] == 1 {
         let sig_off = u16::from_le_bytes([d[4], d[5]]) as usize;
         let sig_ix  = u16::from_le_bytes([d[6], d[7]]);
@@ -244,13 +244,13 @@ fn extract_pk_R_msg_with_expected<'a>(d: &'a [u8], expected_pk: &[u8; 32]) -> Re
             return Ok((pk, R, msg_bytes));
         }
     }
-    // 兜底：从 payload 中定位 "DAO|" 消息，尝试还原 (pk, R)
+   
     let mut msg_off_opt=None;
     for i in 0..d.len().saturating_sub(4) { if &d[i..i+4]==b"DAO|" { msg_off_opt=Some(i); break; } }
     let msg_off = msg_off_opt.ok_or(ProgramError::InvalidInstructionData)?;
     let msg_bytes=&d[msg_off..];
 
-    // 两种常见拼接：(sig|pk|msg) 或 (pk|sig|msg)
+    
     if msg_off>=96 {
         let mut pk=[0u8;32]; pk.copy_from_slice(&d[msg_off-32..msg_off]);
         if &pk==expected_pk {
