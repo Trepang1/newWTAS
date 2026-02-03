@@ -1,0 +1,11 @@
+[package]
+name = "ecc_scalar"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand = "0.8"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+curve25519-dalek = "4"
+blst = "0.3"

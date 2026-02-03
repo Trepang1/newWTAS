@@ -1,0 +1,19 @@
+[package]
+name = "aggtest"
+version = "0.1.0"
+edition = "2021"
+description = "DAO treasury with aggregated Ed25519 authorization (native program)"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "aggtest"
+
+
+
+
+[dependencies]
+solana-program = "1.18.17"
+borsh = "0.10"
+borsh-derive = "0.10"
+
+solana-ed25519-program = "3.0.0"
