@@ -1,0 +1,18 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+curve25519-dalek = "4"
+sha2 = "0.10"
+rand = "0.8"
+solana-client = "2.0.2"   
+solana-sdk = "2.0.2"
+hex = "0.4"
+borsh = "0.10.4"
+borsh-derive = "0.10.4"
+solana-ed25519-program = "3.0.0"
+ed25519-dalek = "1.0"
+anyhow = "1"
+bs58 = "0.5"
