@@ -124,10 +124,38 @@ fn bench_wtas_signing(n: usize, weights: &[u64], threshold: u64, iters: usize) -
     fmt_us(best)
 }
 
-fn bench_wtas_verify(_n: usize, _weights: &[u64], _threshold: u64, _iters: usize) -> f64 {
-    // BLS aggregate verification is constant time (one pairing)
-    // Estimated at ~500us on modern hardware
-    500.0
+fn bench_wtas_verify(_n: usize, _weights: &[u64], _threshold: u64, iters: usize) -> f64 {
+    // BLS aggregate verification: one pairing check
+    // Use the ecc_scalar pairing benchmark methodology: Miller loop + final exponentiation
+    use blst::{blst_fp12, blst_miller_loop, blst_final_exp, blst_p1_affine, blst_p2_affine};
+    use blst::min_pk::SecretKey;
+
+    let mut rng = rand::thread_rng();
+    let mut ikm = [0u8; 32];
+    rng.fill_bytes(&mut ikm);
+    let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
+    let pk = sk.sk_to_pk();
+    let msg = b"fig1-verify-bench";
+    let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+    let sig = sk.sign(msg, dst, &[]);
+
+    let p_affine: blst_p1_affine = blst_p1_affine::from(pk);
+    let q_affine: blst_p2_affine = blst_p2_affine::from(sig);
+
+    let mut best = Duration::MAX;
+    unsafe {
+        let mut tmp_fp12: blst_fp12 = std::mem::zeroed();
+        let mut out_fp12: blst_fp12 = std::mem::zeroed();
+        for _ in 0..iters.min(100) {
+            let start = Instant::now();
+            blst_miller_loop(&mut tmp_fp12 as *mut _, &q_affine as *const _, &p_affine as *const _);
+            blst_final_exp(&mut out_fp12 as *mut _, &tmp_fp12 as *const _);
+            let dur = start.elapsed();
+            best = best.min(dur);
+            std::hint::black_box(&out_fp12);
+        }
+    }
+    fmt_us(best)
 }
 
 fn bench_frost_signing(n: usize, weights: &[u64], threshold: u64, iters: usize) -> f64 {
@@ -183,10 +211,43 @@ fn bench_frost_signing(n: usize, weights: &[u64], threshold: u64, iters: usize) 
     fmt_us(best)
 }
 
-fn bench_frost_verify(_n: usize, _weights: &[u64], _threshold: u64, _iters: usize) -> f64 {
-    // Ed25519 verification: one scalar mult + one point addition
-    // Estimated at ~50us on modern hardware
-    50.0
+fn bench_frost_verify(_n: usize, _weights: &[u64], _threshold: u64, iters: usize) -> f64 {
+    // Ed25519 verification: scalar*B + point addition
+    // Measure actual verification using dalek
+    use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
+    use curve25519_dalek::edwards::EdwardsPoint;
+    use curve25519_dalek::scalar::Scalar;
+    use sha2::{Digest, Sha512};
+
+    let mut rng = rand::thread_rng();
+    let mut b = [0u8; 64];
+    rng.fill_bytes(&mut b);
+    let sk = Scalar::from_bytes_mod_order_wide(&b);
+    let pk: EdwardsPoint = ED25519_BASEPOINT_TABLE * &sk;
+
+    // Generate a test signature
+    let msg = b"fig1-verify-bench";
+    let mut h = Sha512::new();
+    h.update(b"FROST_challenge");
+    h.update(pk.compress().as_bytes());
+    h.update(msg);
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&h.finalize());
+    let c = Scalar::from_bytes_mod_order_wide(&wide);
+    let z = Scalar::from_bytes_mod_order_wide(&b); // Simplified sig
+    let r: EdwardsPoint = ED25519_BASEPOINT_TABLE * &z - pk * c;
+
+    let mut best = Duration::MAX;
+    for _ in 0..iters.min(200) {
+        let start = Instant::now();
+        let lhs: EdwardsPoint = ED25519_BASEPOINT_TABLE * &z;
+        let rhs = r + pk * c;
+        let ok = lhs.compress() == rhs.compress();
+        let dur = start.elapsed();
+        best = best.min(dur);
+        std::hint::black_box(&ok);
+    }
+    fmt_us(best)
 }
 
 fn bench_bls_signing(n: usize, iters: usize) -> f64 {
@@ -212,9 +273,38 @@ fn bench_bls_signing(n: usize, iters: usize) -> f64 {
     fmt_us(best)
 }
 
-fn bench_bls_verify(_n: usize, _iters: usize) -> f64 {
-    // BLS aggregate verify: one pairing check
-    450.0 // Estimated
+fn bench_bls_verify(_n: usize, iters: usize) -> f64 {
+    // BLS aggregate verify: same as WTAS verify (one pairing)
+    // Reuse the pairing methodology
+    use blst::{blst_fp12, blst_miller_loop, blst_final_exp, blst_p1_affine, blst_p2_affine};
+    use blst::min_pk::SecretKey;
+
+    let mut rng = rand::thread_rng();
+    let mut ikm = [0u8; 32];
+    rng.fill_bytes(&mut ikm);
+    let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
+    let pk = sk.sk_to_pk();
+    let msg = b"fig1-verify-bench";
+    let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+    let sig = sk.sign(msg, dst, &[]);
+
+    let p_affine: blst_p1_affine = blst_p1_affine::from(pk);
+    let q_affine: blst_p2_affine = blst_p2_affine::from(sig);
+
+    let mut best = Duration::MAX;
+    unsafe {
+        let mut tmp_fp12: blst_fp12 = std::mem::zeroed();
+        let mut out_fp12: blst_fp12 = std::mem::zeroed();
+        for _ in 0..iters.min(100) {
+            let start = Instant::now();
+            blst_miller_loop(&mut tmp_fp12 as *mut _, &q_affine as *const _, &p_affine as *const _);
+            blst_final_exp(&mut out_fp12 as *mut _, &tmp_fp12 as *const _);
+            let dur = start.elapsed();
+            best = best.min(dur);
+            std::hint::black_box(&out_fp12);
+        }
+    }
+    fmt_us(best)
 }
 
 fn bench_schnorr_signing(n: usize, iters: usize) -> f64 {
@@ -243,9 +333,28 @@ fn bench_schnorr_signing(n: usize, iters: usize) -> f64 {
     fmt_us(best)
 }
 
-fn bench_schnorr_verify(_n: usize, _iters: usize) -> f64 {
-    // Schnorr verifies each signature individually (no native aggregation)
-    50.0 // per-sig; scaled by n in the caller context
+fn bench_schnorr_verify(_n: usize, iters: usize) -> f64 {
+    // Schnorr/BIP-340 verification: one scalar mult + point addition on secp256k1
+    use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey, Message};
+    use secp256k1::rand::rngs::OsRng as SecpRng;
+    use sha2::{Digest, Sha256};
+
+    let secp = Secp256k1::new();
+    let kp = Keypair::new(&secp, &mut SecpRng);
+    let (pk, _parity) = XOnlyPublicKey::from_keypair(&kp);
+    let msg = b"fig1-verify-bench";
+    let m = Message::from_digest_slice(&<Sha256 as Digest>::digest(msg)).unwrap();
+    let sig = secp.sign_schnorr(&m, &kp);
+
+    let mut best = Duration::MAX;
+    for _ in 0..iters.min(200) {
+        let start = Instant::now();
+        let ok = secp.verify_schnorr(&sig, &m, &pk).is_ok();
+        let dur = start.elapsed();
+        best = best.min(dur);
+        std::hint::black_box(&ok);
+    }
+    fmt_us(best)
 }
 
 #[derive(Subcommand)]

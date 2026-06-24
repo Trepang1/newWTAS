@@ -380,12 +380,12 @@ Zero-Knowledge → R3.4: z_enc 的模拟器无法工作  ✗
 
 两种安全性的区别：
 
-| | Soundness | Knowledge Soundness |
-|---|---|---|
-| 定义 | ∀ 恶意 P*, Pr[P* 输出假陈述的有效证明] ≤ negl | ∀ 恶意 P*, ∃ 提取器 E: Pr[P* 输出有效证明 ∧ E 提取 witness 失败] ≤ negl |
-| 保证 | "谎言无法通过验证" | "能从证明中**强制提取**出秘密" |
-| WTAS 需要哪个？ | ❌ | ✅ — 问责性要求从证明中提取签名者身份 (b, w, r_enc) |
-| 提取器 E | 不需要 | **必须构造** |
+|            | Soundness                         | Knowledge Soundness                                      |
+| ---------- | --------------------------------- | -------------------------------------------------------- |
+| 定义         | ∀ 恶意 P*, Pr[P* 输出假陈述的有效证明] ≤ negl | ∀ 恶意 P*, ∃ 提取器 E: Pr[P* 输出有效证明 ∧ E 提取 witness 失败] ≤ negl |
+| 保证         | "谎言无法通过验证"                        | "能从证明中**强制提取**出秘密"                                       |
+| WTAS 需要哪个？ | ❌                                 | ✅ — 问责性要求从证明中提取签名者身份 (b, w, r_enc)                       |
+| 提取器 E      | 不需要                               | **必须构造**                                                 |
 
 你不能只声称 Soundness 然后用它来论证问责性——这是**证明类型选错了**，审稿人说 "the proof and usage require Knowledge Soundness" 就是这个意思。
 
@@ -451,11 +451,12 @@ g'_i = g_i + P_i · λ_key + B · λ_enc^i     (代码 line 294-297)
 参考依据：**Schwartz-Zippel 引理**
 
 引理声明：
+
 > 设 g₁,...,g_n 为从群 G 中独立随机选取的生成元（SETUP 阶段生成）。
 > 设 P₁,...,P_n 为任意群元素（公钥，可能被敌手选择）。
 > 设 B 为独立随机群元素（SETUP 阶段生成）。
 > 设 λ_key, λ_enc 为 Fiat-Shamir 变换从随机神谕中导出的均匀标量。
->
+> 
 > 则向量组 {g'_i = g_i + P_i·λ_key + B·λ_enc^i}_{i=1..n}
 > 线性相关的概率 ≤ 3n / |G|（可忽略）。
 
@@ -501,15 +502,16 @@ fn test_basis_independence() {
 
 #### 修补所需论文篇幅
 
-| 内容 | 位置 | 页数 |
-|------|------|------|
-| 提取器构造 (E 的伪代码 + 分叉引理归约) | Theorem 2 正文 | ~1.5 页 |
-| Knowledge error bound 推导 | Theorem 2 正文 | ~0.5 页 |
-| 基独立性引理 + Schwartz-Zippel 证明 | Appendix | ~0.5-1 页 |
-| 提取器在 accountability 中的应用 | Security Analysis 小节 | ~0.5 页 |
-| **合计** | | **~3-3.5 页** |
+| 内容                          | 位置                   | 页数           |
+| --------------------------- | -------------------- | ------------ |
+| 提取器构造 (E 的伪代码 + 分叉引理归约)     | Theorem 2 正文         | ~1.5 页       |
+| Knowledge error bound 推导    | Theorem 2 正文         | ~0.5 页       |
+| 基独立性引理 + Schwartz-Zippel 证明 | Appendix             | ~0.5-1 页     |
+| 提取器在 accountability 中的应用    | Security Analysis 小节 | ~0.5 页       |
+| **合计**                      |                      | **~3-3.5 页** |
 
 **关键参考文献：**
+
 - **Bünz et al., IEEE S&P 2018** — IPA Knowledge Soundness 的标准模板（§4.2, Appendix A）
 - **Bellare & Neven, ACM CCS 2006** — Generalized Forking Lemma（将 rewinding 论证严格化）
 - **Schwartz (1980) / Zippel (1979)** — 基独立性引理的数学工具
@@ -647,11 +649,13 @@ Simulator(Statement):
 ```
 
 **为什么可行**：
+
 - Bulletproofs 原论文中 `s_L, s_R` 的作用是完全一样的——它们盲化 `l(X), r(X)` 多项式
 - ν 是对 z_enc 的 "s_L 等价物"
 - 由于你的代码已有 `s_L` 的验证路径（`E_enc = B · Σ s_L,i · λ_enc^i`），ν 的验证可以复用同样的代数结构
 
 **代码改动量**：
+
 - `prove()`: +4 行（生成 ν, 计算 D_ν, 修改 z_enc, 在 transcript 中追加 D_ν）
 - `verify_normal()`: +2 行（重构 D_ν 的验证）
 - `verify_fast()`: +2 行（同上）
@@ -687,6 +691,7 @@ Simulator 中：先承诺随机 z_enc，然后编程 RO 使后续挑战值适配
 #### 推荐：方案 A
 
 理由：
+
 1. 与现有代码的盲化框架一致（第五个盲化因子扩展为第六个）
 2. 改动量最小（~20 行代码 + ~1.5 页证明）
 3. 可完全复用 Bulletproofs 的 HVZK 论证模板
@@ -696,15 +701,16 @@ Simulator 中：先承诺随机 z_enc，然后编程 RO 使后续挑战值适配
 
 #### 修补所需工作
 
-| 内容 | 位置 | 工作量 |
-|------|------|--------|
-| 协议修改（加盲化因子 ν） | 协议描述章节 | ~0.5 页 |
-| 模拟器构造（Sim 伪代码） | Theorem 3 证明 | ~1 页 |
-| 不可区分性证明（HYB₀ ≈ HYB₁） | Theorem 3 证明 | ~0.5 页 |
-| 代码修改（prove + verify + test） | `zk/src/main.rs` | ~20 行 |
-| 模拟不可区分性测试 | `zk/src/main.rs` | ~15 行 |
+| 内容                          | 位置               | 工作量    |
+| --------------------------- | ---------------- | ------ |
+| 协议修改（加盲化因子 ν）               | 协议描述章节           | ~0.5 页 |
+| 模拟器构造（Sim 伪代码）              | Theorem 3 证明     | ~1 页   |
+| 不可区分性证明（HYB₀ ≈ HYB₁）        | Theorem 3 证明     | ~0.5 页 |
+| 代码修改（prove + verify + test） | `zk/src/main.rs` | ~20 行  |
+| 模拟不可区分性测试                   | `zk/src/main.rs` | ~15 行  |
 
 **关键参考文献：**
+
 - **Bünz et al., IEEE S&P 2018, §4.1** — Bulletproofs 的 HVZK 盲化技术（s_L, s_R 的设计模式直接适用于 ν）
 - **Pointcheval & Stern, JoC 2000** — ROM 中 Fiat-Shamir 的 ZK 模拟标准方法论
 
