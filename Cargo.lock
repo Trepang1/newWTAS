@@ -74,6 +74,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aggtest_zk"
+version = "0.1.0"
+dependencies = [
+ "borsh 0.10.4",
+ "borsh-derive 0.10.4",
+ "hex",
+ "solana-program 1.18.26",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

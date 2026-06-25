@@ -1,0 +1,24 @@
+[package]
+name = "aggtest_zk"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "1.18"
+borsh = "0.10"
+borsh-derive = "0.10"
+hex = "0.4"
+
+# Note: curve25519-dalek may not compile to sbf-solana target.
+# For on-chain verification, we implement the t-equation check using
+# raw field arithmetic or accept that full IPA verification requires
+# the Gatekeeper off-chain approach (see paper Appendix).
+#
+# The partial verification path (t-equation only) is implemented
+# with estimated CU costs documented below.
+#
+# Full IPA verification would require a Solana precompile for
+# Ristretto point operations, which is currently not available.
