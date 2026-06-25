@@ -1,26 +1,25 @@
 // WTAS: Weighted Threshold Accountable Signatures
 // ===============================================
 // Our scheme — EdDSA/Ed25519-based (pairing-free) weighted threshold signatures
-// with ElGamal-based signer accountability.
+// with ElGamal-based signer accountability and Bulletproofs NIZK proof.
 //
 // Architecture:
 //   Signing layer:  Ed25519 Schnorr-style weighted multi-signature (pairing-free)
-//   ZK proof layer: Bulletproofs IPA on Ristretto (in ../zk/)
+//   ZK proof layer: Bulletproofs IPA on Ristretto (zk crate)
 //   Accountability: ElGamal encryption on Ristretto
-//
-// Comparison schemes in this crate:
-//   virtual_frost.rs — Weighted FROST (Ed25519, 2-round)
-//   schnorr.rs       — Schnorr/BIP-340 baseline (secp256k1)
-//   pr_taps.rs       — Ed25519 baseline (single-signer)
-//   bls_baseline.rs  — BLS pairing-based baseline
 
 use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
+use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::{Identity, MultiscalarMul};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha512};
 use std::time::{Duration, Instant};
+
+// NIZK proof system (our accountability layer)
+use zk::{PublicInput, PublicParams as ZkParams, SecretWitness, WTAPSProof};
 
 // ============================================================
 // Helper: random scalar generation
@@ -61,26 +60,39 @@ fn fmt_rate(op: &str, total: Duration, iters: usize) {
 // ============================================================
 // WTAS Signer
 // ============================================================
+/// WTAS Signer — holds both Ed25519 signing keys and Ristretto accountability keys.
 #[derive(Clone)]
 pub struct WtasSigner {
     pub id: usize,
     pub weight: u64,
-    pub sk: Scalar,              // Secret key (Ed25519 scalar)
-    pub pk: EdwardsPoint,        // Public key = sk * B
+    // Ed25519 signing keys (Edwards curve, cofactor 8)
+    pub sk: Scalar,
+    pub pk: EdwardsPoint,
+    // Ristretto accountability keys (prime-order group, for NIZK)
+    pub sk_ristretto: Scalar,
+    pub pk_ristretto: RistrettoPoint,
 }
 
-// ============================================================
-// WTAS Group (the full protocol state)
-// ============================================================
+/// WTAS accountability proof (NIZK proof + associated data).
+pub struct WtasAccountabilityProof {
+    pub zk_proof: WTAPSProof,
+    pub proof_bytes: usize,
+    pub prove_us: f64,
+}
+
+/// WTAS Group — full protocol state with dual-curve architecture.
 pub struct WtasGroup {
     pub n: usize,
     pub weights: Vec<u64>,
     pub total_weight: u64,
     pub threshold: u64,
     pub signers: Vec<WtasSigner>,
-    pub group_pk: EdwardsPoint,           // Σ w_i * pk_i
-    pub tracer_sk: Scalar,                // Tracer's ElGamal secret key
-    pub tracer_pk: EdwardsPoint,          // Tracer's ElGamal public key
+    pub group_pk: EdwardsPoint,       // Σ w_i * pk_i  (Ed25519)
+    // Tracer keys — Ristretto-based ElGamal for accountability
+    pub tracer_sk: Scalar,
+    pub tracer_pk: RistrettoPoint,
+    // NIZK public parameters (generators g,h,G,H,B)
+    pub zk_params: ZkParams,
 }
 
 // ============================================================
@@ -93,30 +105,41 @@ pub struct WtasSignature {
 
 impl WtasGroup {
     /// Setup: generate n signers with given weights and threshold.
+    /// Each signer gets both Ed25519 (signing) and Ristretto (NIZK) keys.
     pub fn setup(n: usize, weights: &[u64], threshold: u64) -> Self {
         assert_eq!(weights.len(), n);
         let total_weight: u64 = weights.iter().sum();
         assert!(threshold <= total_weight);
 
+        let mut rng = OsRng;
+        let zk_params = ZkParams::new(n, &mut rng);
+
         let mut signers = Vec::with_capacity(n);
         for i in 0..n {
             let sk = random_scalar();
             let pk = ED25519_BASEPOINT_TABLE * &sk;
-            signers.push(WtasSigner { id: i, weight: weights[i], sk, pk });
+            // Ristretto keys for accountability layer
+            let sk_ristretto = random_scalar();
+            let pk_ristretto = zk_params.G * sk_ristretto;
+            signers.push(WtasSigner {
+                id: i, weight: weights[i],
+                sk, pk, sk_ristretto, pk_ristretto,
+            });
         }
 
-        // Group public key = Σ w_i * pk_i
+        // Group public key = Σ w_i * pk_i (Ed25519)
         let mut group_pk = EdwardsPoint::default();
         for s in &signers {
             group_pk += s.pk * Scalar::from(s.weight);
         }
 
+        // Tracer keys on Ristretto (for ElGamal)
         let tracer_sk = random_scalar();
-        let tracer_pk = ED25519_BASEPOINT_TABLE * &tracer_sk;
+        let tracer_pk = zk_params.G * tracer_sk;
 
         WtasGroup {
             n, weights: weights.to_vec(), total_weight, threshold,
-            signers, group_pk, tracer_sk, tracer_pk,
+            signers, group_pk, tracer_sk, tracer_pk, zk_params,
         }
     }
 
@@ -240,21 +263,136 @@ impl WtasGroup {
     }
 
     // ============================================================
-    // ElGamal encryption for accountability (on Ristretto via our scalar)
-    // Each signer's participation bit b_i is encrypted under tracer_pk.
-    // C_i = (r_i * B,  b_i * B + r_i * tracer_pk)
+    // ElGamal encryption for accountability (Ristretto-based)
+    // V_i = r_enc,i * tracer_pk + b_i * B
+    // Returns: (ciphertexts, r_enc vector, b vector)
     // ============================================================
+    pub fn encrypt_participation_ristretto(
+        &self, active: &[usize],
+    ) -> (Vec<RistrettoPoint>, Vec<Scalar>, Vec<Scalar>) {
+        let mut cts = Vec::with_capacity(self.n);
+        let mut r_enc_vec = Vec::with_capacity(self.n);
+        let mut b_vec = Vec::with_capacity(self.n);
+        for i in 0..self.n {
+            let b_i = if active.contains(&i) { Scalar::ONE } else { Scalar::ZERO };
+            let r_enc = random_scalar();
+            let v_i = self.tracer_pk * r_enc + self.zk_params.B * b_i;
+            cts.push(v_i);
+            r_enc_vec.push(r_enc);
+            b_vec.push(b_i);
+        }
+        (cts, r_enc_vec, b_vec)
+    }
+
+    /// Legacy Ed25519-based ElGamal (kept for backward compat tests).
     pub fn encrypt_participation(&self, active: &[usize]) -> Vec<(EdwardsPoint, EdwardsPoint)> {
         let mut cts = Vec::with_capacity(self.n);
         for i in 0..self.n {
             let b_i = if active.contains(&i) { Scalar::ONE } else { Scalar::ZERO };
             let r = random_scalar();
             let c1 = ED25519_BASEPOINT_TABLE * &r;
-            // c2 = b_i * B + r * tracer_pk
-            let c2 = ED25519_BASEPOINT_TABLE * &b_i + self.tracer_pk * r;
+            let c2 = ED25519_BASEPOINT_TABLE * &b_i + ED25519_BASEPOINT_TABLE * &(r * self.tracer_sk);
             cts.push((c1, c2));
         }
         cts
+    }
+
+    // ============================================================
+    // NIZK Accountability Proof (generation)
+    // ============================================================
+    pub fn prove_accountability(
+        &self, active: &[usize],
+    ) -> WtasAccountabilityProof {
+        let (ciphertexts_v, r_enc_vec, b_vec) = self.encrypt_participation_ristretto(active);
+
+        // Ristretto participant keys (one per signer, for all n signers)
+        let participant_keys: Vec<RistrettoPoint> = self.signers.iter()
+            .map(|s| s.pk_ristretto).collect();
+
+        // K_agg = Σ_{i∈active} pk_ristretto_i
+        let mut k_agg = RistrettoPoint::identity();
+        for &i in active {
+            k_agg += self.signers[i].pk_ristretto;
+        }
+
+        // t = Σ b_i * w_i (actual accumulated weight)
+        let w_scalars: Vec<Scalar> = self.weights.iter().map(|w| Scalar::from(*w)).collect();
+        let mut t = Scalar::ZERO;
+        for i in 0..self.n {
+            t += b_vec[i] * w_scalars[i];
+        }
+
+        // Weight commitment c_w = ρ_w·H + Σ w_i·h_i
+        let rho_w = random_scalar();
+        let c_w = RistrettoPoint::multiscalar_mul(
+            std::iter::once(&rho_w).chain(w_scalars.iter()),
+            std::iter::once(&self.zk_params.H).chain(self.zk_params.h_vec.iter()),
+        );
+
+        let w_total = Scalar::from(self.total_weight);
+
+        let public = PublicInput {
+            ciphertexts_v,
+            k_agg,
+            t,
+            pk_enc: self.tracer_pk,
+            participant_keys,
+            c_w,
+            w_total,
+        };
+        let secret = SecretWitness {
+            b: b_vec,
+            w: w_scalars,
+            r_enc: r_enc_vec,
+            rho_w,
+        };
+
+        let mut rng = OsRng;
+        let t0 = Instant::now();
+        let zk_proof = WTAPSProof::prove(&self.zk_params, &public, &secret, &mut rng)
+            .expect("NIZK proof generation failed");
+        let prove_us = t0.elapsed().as_secs_f64() * 1e6;
+        let proof_bytes = zk_proof.proof_size_bytes();
+
+        WtasAccountabilityProof { zk_proof, proof_bytes, prove_us }
+    }
+
+    // ============================================================
+    // NIZK Accountability Proof (verification)
+    // ============================================================
+    pub fn verify_accountability(
+        &self, active: &[usize], proof: &WtasAccountabilityProof,
+    ) -> (bool, Duration) {
+        let (ciphertexts_v, _r_enc, b_vec) = self.encrypt_participation_ristretto(active);
+
+        let participant_keys: Vec<RistrettoPoint> = self.signers.iter()
+            .map(|s| s.pk_ristretto).collect();
+
+        let mut k_agg = RistrettoPoint::identity();
+        for &i in active {
+            k_agg += self.signers[i].pk_ristretto;
+        }
+
+        let w_scalars: Vec<Scalar> = self.weights.iter().map(|w| Scalar::from(*w)).collect();
+        let mut t = Scalar::ZERO;
+        for i in 0..self.n {
+            t += b_vec[i] * w_scalars[i];
+        }
+
+        let rho_w = random_scalar(); // Not needed for verify — verifier recomputes c_w
+        let c_w = RistrettoPoint::multiscalar_mul(
+            std::iter::once(&rho_w).chain(w_scalars.iter()),
+            std::iter::once(&self.zk_params.H).chain(self.zk_params.h_vec.iter()),
+        );
+
+        let public = PublicInput {
+            ciphertexts_v, k_agg, t, pk_enc: self.tracer_pk,
+            participant_keys, c_w, w_total: Scalar::from(self.total_weight),
+        };
+
+        let t0 = Instant::now();
+        let result = proof.zk_proof.verify_fast(&self.zk_params, &public);
+        (result.is_ok(), t0.elapsed())
     }
 
     // ============================================================
@@ -359,15 +497,28 @@ pub fn bench_wtas_full(num_signers: usize, iters: usize) {
     }
     fmt_rate("verify", best_verify, 1);
 
-    // ElGamal encryption
+    // ElGamal encryption (Ristretto)
     let mut best_enc = Duration::MAX;
     for _ in 0..iters {
         let t0 = Instant::now();
-        let cts = group.encrypt_participation(&active);
+        let cts = group.encrypt_participation_ristretto(&active);
         best_enc = best_enc.min(t0.elapsed());
         std::hint::black_box(&cts);
     }
-    fmt_rate("ElGamal encrypt", best_enc, num_signers);
+    fmt_rate("ElGamal enc (Ristretto)", best_enc, num_signers);
+
+    // NIZK proof generation
+    let acc_proof = group.prove_accountability(&active);
+    println!("NIZK prove:          {:>9.1} µs,  {} bytes",
+        acc_proof.prove_us, acc_proof.proof_bytes);
+
+    // NIZK proof verification
+    let mut best_zk_verify = Duration::MAX;
+    for _ in 0..iters.min(5) {
+        let (ok, dt) = group.verify_accountability(&active, &acc_proof);
+        if ok { best_zk_verify = best_zk_verify.min(dt); }
+    }
+    fmt_rate("NIZK verify", best_zk_verify, 1);
 
     // Weight update
     let mut best_update = Duration::MAX;
@@ -391,6 +542,8 @@ pub fn bench_wtas_full(num_signers: usize, iters: usize) {
     println!("  n={num_signers}  k={k}  total_w={total_weight}  thr={threshold}");
     println!("  sign_us={:.1}  verify_us={:.1}  comm_bytes={comm}",
         total_sign.as_secs_f64() * 1e6, best_verify.as_secs_f64() * 1e6);
+    println!("  prove_us={:.1}  verify_zk_us={:.1}  proof_bytes={}",
+        acc_proof.prove_us, best_zk_verify.as_secs_f64() * 1e6, acc_proof.proof_bytes);
 }
 
 // ============================================================

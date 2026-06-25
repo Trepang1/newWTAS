@@ -15,62 +15,54 @@ struct Cli {
 }
 
 /// Run the full Figure 1 comparison benchmark
-/// Tests all schemes across varying numbers of signers
+/// WTAS vs V-FROST vs WTS(Das) vs TAPS
 fn bench_fig1(sizes: &[usize], iters: usize) -> Result<()> {
     println!("==============================================");
     println!("  Figure 1: Comprehensive Protocol Comparison");
-    println!("  Benchmarks: WTAS vs Weighted FROST vs BLS vs Schnorr");
+    println!("  WTAS vs V-FROST vs WTS (Das) vs TAPS");
     println!("==============================================\n");
 
-    // CSV header for easy plotting
-    println!("scheme,n_signers,active_signers,total_weight,threshold,sign_us,verify_us,comm_bytes,comm_per_signer");
+    println!("scheme,n_signers,active_signers,total_weight,threshold,sign_us,verify_us,comm_bytes,comm_per_signer,proof_bytes");
 
     for &n in sizes {
-        let weights: Vec<u64> = (0..n)
-            .map(|i| 2u64.pow((i % 4) as u32))
-            .collect();
+        let weights: Vec<u64> = (0..n).map(|i| 2u64.pow((i % 4) as u32)).collect();
         let total_weight: u64 = weights.iter().sum();
         let threshold = (total_weight + 1) / 2;
 
-        // Count how many signers needed to meet threshold
         let mut cum = 0u64;
         let mut k = 0usize;
         for &w in &weights {
             if cum >= threshold { break; }
-            cum += w;
-            k += 1;
+            cum += w; k += 1;
         }
 
         let log_n = (n as f64).log2().ceil() as usize;
 
-        // --- WTAS (our scheme: Ed25519, pairing-free) ---
+        // --- WTAS (our scheme) ---
         let sign_us = bench_wtas_signing(n, &weights, threshold, iters);
         let verify_us = bench_wtas_verify(n, &weights, threshold, iters);
-        // Comm: 64B per active signer (R_i + s_i) + 64B ElGamal ct + NIZK proof
         let comm = 128 * k + (2 * log_n + 6) * 32 + 5 * 32;
-        println!("WTAS,{n},{k},{total_weight},{threshold},{sign_us:.1},{verify_us:.1},{comm},{:.0}", comm as f64 / k as f64);
+        let proof_bytes = (2 * log_n + 6) * 32 + 5 * 32;
+        println!("WTAS,{n},{k},{total_weight},{threshold},{sign_us:.1},{verify_us:.1},{comm},{:.0},{proof_bytes}", comm as f64 / k as f64);
 
-        // --- Weighted FROST (Virtualization: weight w → w virtual nodes) ---
-        // Communication scales with total_active_weight (Σ w_i of active signers),
-        // NOT with k (number of signers). Each virtual node sends its own nonce + partial sig.
+        // --- V-FROST (virtualization O(Σw)) ---
         let sign_us = bench_frost_signing(n, &weights, threshold, cum, iters);
         let verify_us = bench_frost_verify(n, &weights, threshold, iters);
-        let comm_frost = 96 * cum as usize; // 96 bytes per virtual node
-        println!("WeightedFROST,{n},{k},{total_weight},{threshold},{sign_us:.1},{verify_us:.1},{comm_frost},{:.0}", comm_frost as f64 / k as f64);
+        let comm_frost = 96 * cum as usize;
+        println!("V-FROST,{n},{k},{total_weight},{threshold},{sign_us:.1},{verify_us:.1},{comm_frost},{:.0},0", comm_frost as f64 / k as f64);
 
-        // --- BLS Baseline (equal weight, no accountability) ---
-        let sign_us = bench_bls_signing(n, iters);
-        let verify_us = bench_bls_verify(n, iters);
-        let comm_bls = 96; // Single aggregate signature
-        println!("BLS(baseline),{n},{n},-,{n},{sign_us:.1},{verify_us:.1},{comm_bls},{:.0}", comm_bls as f64 / n as f64);
+        // --- WTS (Das et al. 2023, BLS12-381) ---
+        let sign_us = bench_wts_signing(n, &weights, threshold, iters);
+        let verify_us = bench_wts_verify(n, iters);
+        let comm_wts = 96; // 1 BLS aggregate sig
+        println!("WTS(Das),{n},{k},{total_weight},{threshold},{sign_us:.1},{verify_us:.1},{comm_wts},{:.0},0", comm_wts as f64 / k as f64);
 
-        // --- Schnorr Baseline (equal weight, no accountability) ---
-        let sign_us = bench_schnorr_signing(n, iters);
-        let verify_us = bench_schnorr_verify(n, iters);
-        let comm_schnorr = 64; // Single Schnorr signature (R + s)
-        println!("Schnorr(baseline),{n},{n},-,{n},{sign_us:.1},{verify_us:.1},{comm_schnorr},{:.0}", comm_schnorr as f64 / n as f64);
+        // --- TAPS (Boneh-Komlo 2022, Ed25519 equal-weight) ---
+        let (sign_us, verify_us) = bench_taps_path(n, iters);
+        let comm_taps = 64 + n * 64 + (n + 7) * 32 + (2 * n + 4) * 32; // sig + ElGamal + Sigma NIZK
+        println!("TAPS,{n},{n},-,{n},{sign_us:.1},{verify_us:.1},{comm_taps},{:.0},{}", comm_taps as f64 / n as f64, (n + 7) * 32 + (2 * n + 4) * 32);
 
-        println!(); // Empty line between sizes
+        println!();
     }
 
     Ok(())
@@ -78,6 +70,134 @@ fn bench_fig1(sizes: &[usize], iters: usize) -> Result<()> {
 
 fn fmt_us(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
+}
+
+// ---- WTS (Das et al. 2023): BLS12-381 weighted threshold ----
+fn bench_wts_signing(n: usize, weights: &[u64], threshold: u64, iters: usize) -> f64 {
+    use blst::min_pk::SecretKey;
+    const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+    let message = b"fig1-bench-msg";
+    let mut rng = rand::thread_rng();
+
+    let mut sks = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut ikm = [0u8; 32];
+        rng.fill_bytes(&mut ikm);
+        sks.push(SecretKey::key_gen(&ikm, &[]).unwrap());
+    }
+
+    // Select signers meeting threshold
+    let mut active = Vec::new();
+    let mut cum = 0u64;
+    for i in 0..n {
+        if cum >= threshold { break; }
+        active.push(i);
+        cum += weights[i];
+    }
+
+    let mut best = Duration::MAX;
+    for _ in 0..iters.min(100) {
+        let t0 = Instant::now();
+        let sigs: Vec<_> = active.iter().map(|&i| sks[i].sign(message, DST, &[])).collect();
+        let sig_refs: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
+        let _agg = blst::min_pk::AggregateSignature::aggregate(&sig_refs, true).unwrap();
+        best = best.min(t0.elapsed());
+    }
+    fmt_us(best)
+}
+
+fn bench_wts_verify(n: usize, iters: usize) -> f64 {
+    use blst::min_pk::SecretKey;
+    const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+    let message = b"fig1-bench-msg";
+    let mut rng = rand::thread_rng();
+
+    let mut ikm = [0u8; 32]; rng.fill_bytes(&mut ikm);
+    let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
+    let pk = sk.sk_to_pk();
+    let sig = sk.sign(message, DST, &[]);
+    let pks = [&pk];
+
+    let mut best = Duration::MAX;
+    for _ in 0..iters.min(100) {
+        let start = Instant::now();
+        let ok = sig.fast_aggregate_verify(true, message, DST, &pks) == blst::BLST_ERROR::BLST_SUCCESS;
+        best = best.min(start.elapsed());
+        std::hint::black_box(&ok);
+    }
+    fmt_us(best)
+}
+
+// ---- TAPS (Boneh-Komlo 2022): Ed25519 equal-weight threshold ----
+fn bench_taps_path(n: usize, iters: usize) -> (f64, f64) {
+    use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
+    use curve25519_dalek::edwards::EdwardsPoint;
+    use curve25519_dalek::scalar::Scalar;
+    use sha2::{Digest, Sha512};
+
+    let msg = b"fig1-bench-msg";
+    let mut rng = rand::thread_rng();
+
+    let mut sks = Vec::with_capacity(n);
+    let mut pks = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut b = [0u8; 64]; rng.fill_bytes(&mut b);
+        let sk = Scalar::from_bytes_mod_order_wide(&b);
+        let pk: EdwardsPoint = ED25519_BASEPOINT_TABLE * &sk;
+        sks.push(sk); pks.push(pk);
+    }
+
+    let active: Vec<usize> = (0..n).collect(); // all signers (equal-weight)
+    let k = active.len();
+
+    // Active PK
+    let mut active_pk = EdwardsPoint::default();
+    for &i in &active { active_pk += pks[i]; }
+
+    // Sign
+    let mut best_sign = Duration::MAX;
+    for _ in 0..iters.min(100) {
+        let t0 = Instant::now();
+        let mut r_agg = EdwardsPoint::default();
+        for _ in 0..k {
+            let mut b = [0u8; 64]; rng.fill_bytes(&mut b);
+            let r = Scalar::from_bytes_mod_order_wide(&b);
+            r_agg += ED25519_BASEPOINT_TABLE * &r;
+        }
+        let mut h = Sha512::new();
+        h.update(b"TAPS_challenge"); h.update(r_agg.compress().as_bytes());
+        h.update(active_pk.compress().as_bytes()); h.update(msg);
+        let mut wide = [0u8; 64]; wide.copy_from_slice(&h.finalize());
+        let c = Scalar::from_bytes_mod_order_wide(&wide);
+        let s_agg: Scalar = active.iter().map(|&i| {
+            let mut b = [0u8; 64]; rng.fill_bytes(&mut b);
+            Scalar::from_bytes_mod_order_wide(&b) + c * sks[i]
+        }).sum();
+        std::hint::black_box((r_agg, s_agg));
+        best_sign = best_sign.min(t0.elapsed());
+    }
+
+    // Verify
+    let mut best_verify = Duration::MAX;
+    for _ in 0..iters.min(200) {
+        let start = Instant::now();
+        let mut r_agg = EdwardsPoint::default();
+        let mut r = [0u8; 64]; rng.fill_bytes(&mut r);
+        r_agg += ED25519_BASEPOINT_TABLE * &Scalar::from_bytes_mod_order_wide(&r);
+        let mut h = Sha512::new();
+        h.update(b"TAPS_challenge"); h.update(r_agg.compress().as_bytes());
+        h.update(active_pk.compress().as_bytes()); h.update(msg);
+        let mut wide = [0u8; 64]; wide.copy_from_slice(&h.finalize());
+        let c = Scalar::from_bytes_mod_order_wide(&wide);
+        let s = Scalar::from_bytes_mod_order_wide(&r);
+        let lhs: EdwardsPoint = ED25519_BASEPOINT_TABLE * &s;
+        let rhs = r_agg + active_pk * c;
+        let ok = lhs.compress() == rhs.compress();
+        std::hint::black_box(&ok);
+        best_verify = best_verify.min(start.elapsed());
+    }
+
+    (fmt_us(best_sign), fmt_us(best_verify))
 }
 
 // ---- Individual scheme benchmarks (used by bench_fig1) ----

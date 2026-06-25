@@ -3170,8 +3170,10 @@ dependencies = [
  "ed25519-dalek",
  "merlin",
  "rand 0.8.5",
+ "rand_core 0.6.4",
  "secp256k1",
  "sha2 0.10.9",
+ "zk",
 ]
 
 [[package]]

@@ -18,10 +18,18 @@ merlin = "3"
 # Ed25519 single-signer baseline (optional)
 ed25519-dalek = { version = "1.0", optional = true }
 
+# NIZK proof system (our scheme)
+zk = { path = "../zk" }
+
+# rand_core for RngCore in ZK
+rand_core = "0.6"
+
 [features]
-default = ["wtas", "virtual_frost", "bls_baseline", "schnorr"]
+default = ["wtas", "virtual_frost", "wts_das", "taps"]
 wtas = []
 virtual_frost = []
+wts_das = []
+taps = []
 bls_baseline = []
-schnorr = []
-pr_taps = ["ed25519-dalek"]
+schnorr = []      # deprecated, kept for backward compat
+pr_taps = ["ed25519-dalek"]  # deprecated, kept for backward compat
