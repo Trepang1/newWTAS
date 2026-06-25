@@ -9,15 +9,19 @@ rand = "0.8"
 sha2 = "0.10"
 secp256k1 = { version = "0.28.2", features = ["rand-std", "global-context"] }
 
-# 只在启用 pr_taps 时编译，避免影响其它模块
-ed25519-dalek = { version = "1.0", optional = true }
-
-# Virtual/Weighted FROST dependencies
+# WTAS (our scheme) + Virtual FROST comparison
 curve25519-dalek = "4"
+
+# Virtual FROST uses merlin for transcript hashing
 merlin = "3"
 
+# Ed25519 single-signer baseline (optional)
+ed25519-dalek = { version = "1.0", optional = true }
+
 [features]
-default = ["schnorr", "virtual_frost"]
+default = ["wtas", "virtual_frost", "bls_baseline", "schnorr"]
+wtas = []
+virtual_frost = []
+bls_baseline = []
 schnorr = []
-pr_taps = ["ed25519-dalek"]       # 启用 pr_taps 时，顺带启用可选依赖
-virtual_frost = []                 # Virtual/Weighted FROST for comparison
+pr_taps = ["ed25519-dalek"]

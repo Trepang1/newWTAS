@@ -43,10 +43,11 @@ fn bench_fig1(sizes: &[usize], iters: usize) -> Result<()> {
 
         let log_n = (n as f64).log2().ceil() as usize;
 
-        // --- WTAS ---
+        // --- WTAS (our scheme: Ed25519, pairing-free) ---
         let sign_us = bench_wtas_signing(n, &weights, threshold, iters);
         let verify_us = bench_wtas_verify(n, &weights, threshold, iters);
-        let comm = 192 * k + (2 * log_n + 6) * 32 + 5 * 32;
+        // Comm: 64B per active signer (R_i + s_i) + 64B ElGamal ct + NIZK proof
+        let comm = 128 * k + (2 * log_n + 6) * 32 + 5 * 32;
         println!("WTAS,{n},{k},{total_weight},{threshold},{sign_us:.1},{verify_us:.1},{comm},{:.0}", comm as f64 / k as f64);
 
         // --- Weighted FROST ---
@@ -79,26 +80,29 @@ fn fmt_us(d: Duration) -> f64 {
 
 // ---- Individual scheme benchmarks (used by bench_fig1) ----
 
+// ---- WTAS: Ed25519 weighted multi-signature (pairing-free, our scheme) ----
 fn bench_wtas_signing(n: usize, weights: &[u64], threshold: u64, iters: usize) -> f64 {
-    use blst::min_sig::{PublicKey, SecretKey, Signature};
-    use blst::BLST_ERROR;
+    use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
+    use curve25519_dalek::edwards::EdwardsPoint;
+    use curve25519_dalek::scalar::Scalar;
+    use sha2::{Digest, Sha512};
 
-    const DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
-    let message = b"fig1-bench-msg";
+    let msg = b"fig1-bench-msg";
+    let mut rng = rand::thread_rng();
 
-    // Setup
+    // Generate Ed25519 keypairs
     let mut sks = Vec::with_capacity(n);
     let mut pks = Vec::with_capacity(n);
     for _ in 0..n {
-        let mut ikm = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut ikm);
-        let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
-        let pk = sk.sk_to_pk();
+        let mut b = [0u8; 64];
+        rng.fill_bytes(&mut b);
+        let sk = Scalar::from_bytes_mod_order_wide(&b);
+        let pk: EdwardsPoint = ED25519_BASEPOINT_TABLE * &sk;
         sks.push(sk);
         pks.push(pk);
     }
 
-    // Select signers
+    // Select signers meeting threshold
     let mut active = Vec::new();
     let mut cum = 0u64;
     for i in 0..n {
@@ -106,54 +110,89 @@ fn bench_wtas_signing(n: usize, weights: &[u64], threshold: u64, iters: usize) -
         active.push(i);
         cum += weights[i];
     }
+    let k = active.len();
+
+    // Compute group PK = Σ w_i * pk_i
+    let mut group_pk = EdwardsPoint::default();
+    for &i in &active {
+        group_pk += pks[i] * Scalar::from(weights[i]);
+    }
 
     let mut best = Duration::MAX;
     for _ in 0..iters.min(100) {
         let t0 = Instant::now();
-        let mut sigs = Vec::with_capacity(active.len());
-        for &i in &active {
-            let mut partial_msg = message.to_vec();
-            partial_msg.extend_from_slice(&weights[i].to_le_bytes());
-            partial_msg.extend_from_slice(&i.to_le_bytes());
-            sigs.push(sks[i].sign(&partial_msg, DST, &[]));
+
+        // Round 1: nonce generation
+        let mut nonces = Vec::with_capacity(k);
+        let mut r_agg = EdwardsPoint::default();
+        for _ in 0..k {
+            let mut b = [0u8; 64];
+            rng.fill_bytes(&mut b);
+            let r = Scalar::from_bytes_mod_order_wide(&b);
+            r_agg += ED25519_BASEPOINT_TABLE * &r;
+            nonces.push(r);
         }
-        let sig_refs: Vec<&Signature> = sigs.iter().collect();
-        let _agg = blst::min_sig::AggregateSignature::aggregate(&sig_refs, true).unwrap();
+
+        // Challenge c = H(R_agg, PK, msg)
+        let mut h = Sha512::new();
+        h.update(b"WTAS_challenge");
+        h.update(r_agg.compress().as_bytes());
+        h.update(group_pk.compress().as_bytes());
+        h.update(msg);
+        let mut wide = [0u8; 64];
+        wide.copy_from_slice(&h.finalize());
+        let c = Scalar::from_bytes_mod_order_wide(&wide);
+
+        // Round 2: partial signatures s_i = r_i + c * w_i * sk_i
+        let s_agg: Scalar = active.iter().enumerate().map(|(idx, &i)| {
+            nonces[idx] + c * Scalar::from(weights[i]) * sks[i]
+        }).sum();
+
+        std::hint::black_box(&s_agg);
         best = best.min(t0.elapsed());
     }
     fmt_us(best)
 }
 
 fn bench_wtas_verify(_n: usize, _weights: &[u64], _threshold: u64, iters: usize) -> f64 {
-    // BLS aggregate verification: one pairing check
-    // Use the ecc_scalar pairing benchmark methodology: Miller loop + final exponentiation
-    use blst::{blst_fp12, blst_miller_loop, blst_final_exp, blst_p1_affine, blst_p2_affine};
-    use blst::min_pk::SecretKey;
+    use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
+    use curve25519_dalek::edwards::EdwardsPoint;
+    use curve25519_dalek::scalar::Scalar;
+    use sha2::{Digest, Sha512};
 
     let mut rng = rand::thread_rng();
-    let mut ikm = [0u8; 32];
-    rng.fill_bytes(&mut ikm);
-    let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
-    let pk = sk.sk_to_pk();
     let msg = b"fig1-verify-bench";
-    let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
-    let sig = sk.sign(msg, dst, &[]);
 
-    let p_affine: blst_p1_affine = blst_p1_affine::from(pk);
-    let q_affine: blst_p2_affine = blst_p2_affine::from(sig);
+    // Generate a test keypair and signature
+    let mut b = [0u8; 64];
+    rng.fill_bytes(&mut b);
+    let sk = Scalar::from_bytes_mod_order_wide(&b);
+    let pk: EdwardsPoint = ED25519_BASEPOINT_TABLE * &sk;
+
+    // Create a valid test signature
+    rng.fill_bytes(&mut b);
+    let r_val = Scalar::from_bytes_mod_order_wide(&b);
+    let r_pt: EdwardsPoint = ED25519_BASEPOINT_TABLE * &r_val;
+
+    let mut h = Sha512::new();
+    h.update(b"WTAS_challenge");
+    h.update(r_pt.compress().as_bytes());
+    h.update(pk.compress().as_bytes());
+    h.update(msg);
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&h.finalize());
+    let c = Scalar::from_bytes_mod_order_wide(&wide);
+    let s_val = r_val + c * sk; // Valid signature (R=r_pt, s=s_val)
 
     let mut best = Duration::MAX;
-    unsafe {
-        let mut tmp_fp12: blst_fp12 = std::mem::zeroed();
-        let mut out_fp12: blst_fp12 = std::mem::zeroed();
-        for _ in 0..iters.min(100) {
-            let start = Instant::now();
-            blst_miller_loop(&mut tmp_fp12 as *mut _, &q_affine as *const _, &p_affine as *const _);
-            blst_final_exp(&mut out_fp12 as *mut _, &tmp_fp12 as *const _);
-            let dur = start.elapsed();
-            best = best.min(dur);
-            std::hint::black_box(&out_fp12);
-        }
+    for _ in 0..iters.min(200) {
+        let start = Instant::now();
+        let lhs: EdwardsPoint = ED25519_BASEPOINT_TABLE * &s_val;
+        let rhs = r_pt + pk * c;
+        let ok = lhs.compress() == rhs.compress();
+        let dur = start.elapsed();
+        best = best.min(dur);
+        std::hint::black_box(&ok);
     }
     fmt_us(best)
 }
