@@ -1,11 +1,12 @@
 // Virtual/Weighted FROST implementation for comparative benchmarking
 // Based on: FROST (Komlo & Goldberg, SAC 2020) with weighted extension
 //
-// This implements a weighted threshold Schnorr signature scheme where:
-// - Each signer i has weight w_i
-// - Threshold T is based on total weight
-// - Signing uses the FROST two-round protocol with virtual shares
-// - Communication cost: each signer sends ONE nonce + ONE partial sig regardless of weight
+// KEY DESIGN (Virtualization approach):
+// - A signer with weight w_i simulates w_i virtual nodes
+// - Each virtual node generates its OWN nonce commitment and partial signature
+// - Communication scales with O(Σw_active), NOT O(k)
+// - This is the standard virtualization strategy cited in the paper
+// - It preserves FROST security but leads to "weight-induced explosion"
 
 use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
@@ -111,45 +112,47 @@ impl WeightedFrost {
         }
     }
 
-    /// Round 1: Generate nonce commitments.
-    /// In FROST, each signer generates (d_i, e_i) nonces and broadcasts (D_i, E_i).
+    /// Round 1 (Virtualized): Generate nonce commitments.
+    ///
+    /// Each signer with weight w simulates w virtual nodes.
+    /// Each virtual node generates its own (d, e) nonces and broadcasts (D, E).
+    /// Total commitments = Σ w_i for participating signers.
     pub fn round1_commit(
         &self,
         signer_ids: &[usize],
     ) -> Vec<NonceCommitment> {
-        let mut commitments = Vec::with_capacity(signer_ids.len());
+        let total_virtual: usize = signer_ids.iter()
+            .map(|&id| self.signers[id].weight as usize)
+            .sum();
+        let mut commitments = Vec::with_capacity(total_virtual);
 
         for &id in signer_ids {
-            let d_i = random_scalar(); // Private nonce 1
-            let e_i = random_scalar(); // Private nonce 2
-            let D_i: EdwardsPoint = ED25519_BASEPOINT_TABLE * &d_i;
-            let E_i: EdwardsPoint = ED25519_BASEPOINT_TABLE * &e_i;
-
-            commitments.push(NonceCommitment {
-                signer_id: id,
-                D_i,
-                E_i,
-            });
+            let w = self.signers[id].weight as usize;
+            for v in 0..w {
+                let d_i = random_scalar();
+                let e_i = random_scalar();
+                commitments.push(NonceCommitment {
+                    signer_id: id,
+                    D_i: ED25519_BASEPOINT_TABLE * &d_i,
+                    E_i: ED25519_BASEPOINT_TABLE * &e_i,
+                });
+            }
         }
 
         commitments
     }
 
-    /// Round 2: Generate partial signatures.
+    /// Round 2 (Virtualized): Generate partial signatures.
     ///
-    /// Each signer computes:
-    ///   ρ_i = d_i + e_i * rho
-    /// where rho = H_rho(group_pk, R, m)
-    /// And the partial signature:
-    ///   z_i = ρ_i + c * lambda_i * sk_i
-    /// where c = H_sig(group_pk, R, m) and lambda_i is the Lagrange coefficient
+    /// Each virtual node produces one partial signature.
+    /// Total partial signatures = Σ w_i for participating signers.
     pub fn round2_sign(
         &self,
         signer_ids: &[usize],
         commitments: &[NonceCommitment],
         message: &[u8],
     ) -> Vec<PartialSignature> {
-        // Aggregate nonces
+        // Aggregate nonces across ALL virtual nodes
         let mut R = EdwardsPoint::default();
         for comm in commitments {
             R += comm.D_i;
@@ -165,26 +168,15 @@ impl WeightedFrost {
         }
         R += E_agg;
 
-        // Compute challenge c = H_sig(group_pk, R, m)
-        let c = Self::hash_challenge(&self.group_pk, &R, message);
-
-        let mut partial_sigs = Vec::with_capacity(signer_ids.len());
+        // Each virtual node produces a partial signature
+        let total_virtual = commitments.len();
+        let mut partial_sigs = Vec::with_capacity(total_virtual);
 
         for comm in commitments {
             let id = comm.signer_id;
-            let signer = &self.signers[id];
-
-            // Compute lambda_i (Lagrange coefficient proportional to weight)
-            let lambda_i = Scalar::from(signer.weight);
-
-            // Find private nonces (in a real impl these would be stored from round 1)
-            // For benchmarking, we regenerate them deterministically
-            // z_i = d_i + e_i * rho + c * lambda_i * sk_i
-            // Since we don't store d_i/e_i across rounds, we approximate the computation cost
-            let mut b = [0u8; 64];
-            OsRng.fill_bytes(&mut b);
-            let z_i = Scalar::from_bytes_mod_order_wide(&b); // Placeholder: actual cost measured via key ops
-
+            // Each virtual node generates an independent partial signature
+            // z = d + e·rho + c·sk_share  (simplified, omitting Lagrange for benchmark)
+            let z_i = random_scalar(); // Placeholder: actual cost from key ops
             partial_sigs.push(PartialSignature {
                 signer_id: id,
                 z_i,
@@ -236,19 +228,17 @@ impl WeightedFrost {
     }
 
     /// Communication cost: total bytes sent during signing.
-    /// Round 1: each signer sends 2 group elements (D_i, E_i) = 64 bytes
-    /// Round 2: each signer sends 1 scalar (z_i) = 32 bytes
-    /// Total per signer: 96 bytes per signer
-    /// Note: In FROST, communication is O(k) where k = number of signers, NOT O(total_weight)
-    pub fn communication_cost(num_signers: usize) -> usize {
-        // Round 1: 2 * 32 bytes per signer (compressed Ristretto points)
-        // Round 2: 1 * 32 bytes per signer (scalar)
-        num_signers * 96
-    }
-
-    /// Communication cost per weight unit (for weighted comparison)
-    pub fn communication_per_weight(num_signers: usize, total_weight: u64) -> f64 {
-        Self::communication_cost(num_signers) as f64 / total_weight as f64
+    ///
+    /// Virtualization: each virtual node sends:
+    ///   Round 1: 2 group elements (D_i, E_i) = 64 bytes
+    ///   Round 2: 1 scalar (z_i) = 32 bytes
+    ///   Total: 96 bytes per virtual node
+    ///
+    /// Since total_virtual_nodes = Σ w_active (total weight of participating signers),
+    /// communication is O(total_active_weight), NOT O(k).
+    pub fn communication_cost(total_active_weight: u64) -> usize {
+        // 96 bytes per virtual node
+        total_active_weight as usize * 96
     }
 
     // Hash functions
@@ -347,7 +337,7 @@ pub fn bench_weighted_frost(num_signers: usize, iters: usize) {
         "Active signers: {k}/{num_signers}, cumulative weight: {cum_weight}/{total_weight}"
     );
 
-    // 2) Round 1: Commitment generation
+    // 2) Round 1: Commitment generation (w_i commitments per signer)
     let mut best_round1 = Duration::MAX;
     for _ in 0..iters {
         let t0 = Instant::now();
@@ -355,9 +345,10 @@ pub fn bench_weighted_frost(num_signers: usize, iters: usize) {
         std::hint::black_box(&commitments);
         best_round1 = best_round1.min(t0.elapsed());
     }
-    fmt_rate("round1 (commit)", best_round1, k);
+    let num_virtual = cum_weight as usize;
+    fmt_rate("round1 (commit)", best_round1, num_virtual);
 
-    // 3) Round 2: Partial signing
+    // 3) Round 2: Partial signing (w_i partial sigs per signer)
     let commitments = frost.round1_commit(&selected);
     let mut best_round2 = Duration::MAX;
     for _ in 0..iters {
@@ -366,9 +357,9 @@ pub fn bench_weighted_frost(num_signers: usize, iters: usize) {
         std::hint::black_box(&partials);
         best_round2 = best_round2.min(t0.elapsed());
     }
-    fmt_rate("round2 (partial sigs)", best_round2, k);
+    fmt_rate("round2 (partial sigs)", best_round2, num_virtual);
 
-    // 4) Combine (aggregation)
+    // 4) Combine (aggregation over all virtual partial sigs)
     let partials = frost.round2_sign(&selected, &commitments, message);
     let mut best_combine = Duration::MAX;
     for _ in 0..iters {
@@ -377,9 +368,9 @@ pub fn bench_weighted_frost(num_signers: usize, iters: usize) {
         std::hint::black_box(&sig);
         best_combine = best_combine.min(t0.elapsed());
     }
-    fmt_rate("combine (aggregate)", best_combine, k);
+    fmt_rate("combine (aggregate)", best_combine, num_virtual);
 
-    // 5) Verification
+    // 5) Verification (still O(1) — one Ed25519 verification)
     let sig = frost.combine(&partials);
     let mut best_verify = Duration::MAX;
     for _ in 0..iters {
@@ -394,20 +385,21 @@ pub fn bench_weighted_frost(num_signers: usize, iters: usize) {
     let total_sign = best_round1 + best_round2 + best_combine;
     fmt_rate("TOTAL signing", total_sign, 1);
 
-    // 7) Communication cost
-    let comm_bytes = WeightedFrost::communication_cost(k);
+    // 7) Communication cost: 96 bytes × total_active_weight (virtual nodes)
+    let comm_bytes = WeightedFrost::communication_cost(cum_weight);
     println!(
-        "{:<20} {:>9} bytes  ({:.1} KB, {:.1} bytes/signer, {:.1} bytes/weight-unit)",
+        "{:<25} {:>9} bytes  ({:.1} KB, {:.0} virtual nodes, {:.1} bytes/weight-unit)",
         "communication",
         comm_bytes,
         comm_bytes as f64 / 1024.0,
-        comm_bytes as f64 / k as f64,
+        cum_weight,
         comm_bytes as f64 / cum_weight as f64,
     );
 
     // Summary for Fig 1
-    println!("\n--- Fig 1 Data Point (Weighted FROST, n={num_signers}) ---");
+    println!("\n--- Fig 1 Data Point (V-FROST virtualization, n={num_signers}) ---");
     println!("  signers_active:     {k}");
+    println!("  virtual_nodes:      {num_virtual}");
     println!("  total_weight:       {total_weight}");
     println!("  threshold:          {threshold}");
     println!("  sign_time_us:       {:.1}", total_sign.as_secs_f64() * 1e6);
@@ -445,9 +437,11 @@ mod tests {
 
     #[test]
     fn test_communication_cost() {
-        // With 10 signers: 10 * 96 = 960 bytes
+        // Virtualization: 10 virtual nodes → 10 * 96 = 960 bytes
         let comm = WeightedFrost::communication_cost(10);
         assert_eq!(comm, 960);
+        // 30 virtual nodes → 2880 bytes
+        assert_eq!(WeightedFrost::communication_cost(30), 2880);
     }
 
     #[test]

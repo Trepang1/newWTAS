@@ -50,10 +50,12 @@ fn bench_fig1(sizes: &[usize], iters: usize) -> Result<()> {
         let comm = 128 * k + (2 * log_n + 6) * 32 + 5 * 32;
         println!("WTAS,{n},{k},{total_weight},{threshold},{sign_us:.1},{verify_us:.1},{comm},{:.0}", comm as f64 / k as f64);
 
-        // --- Weighted FROST ---
-        let sign_us = bench_frost_signing(n, &weights, threshold, iters);
+        // --- Weighted FROST (Virtualization: weight w → w virtual nodes) ---
+        // Communication scales with total_active_weight (Σ w_i of active signers),
+        // NOT with k (number of signers). Each virtual node sends its own nonce + partial sig.
+        let sign_us = bench_frost_signing(n, &weights, threshold, cum, iters);
         let verify_us = bench_frost_verify(n, &weights, threshold, iters);
-        let comm_frost = 96 * k; // 2*32B (D_i,E_i) + 32B (z_i) per signer
+        let comm_frost = 96 * cum as usize; // 96 bytes per virtual node
         println!("WeightedFROST,{n},{k},{total_weight},{threshold},{sign_us:.1},{verify_us:.1},{comm_frost},{:.0}", comm_frost as f64 / k as f64);
 
         // --- BLS Baseline (equal weight, no accountability) ---
@@ -197,14 +199,14 @@ fn bench_wtas_verify(_n: usize, _weights: &[u64], _threshold: u64, iters: usize)
     fmt_us(best)
 }
 
-fn bench_frost_signing(n: usize, weights: &[u64], threshold: u64, iters: usize) -> f64 {
+fn bench_frost_signing(n: usize, weights: &[u64], threshold: u64, total_active_weight: u64, iters: usize) -> f64 {
     use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
     use curve25519_dalek::scalar::Scalar;
 
     let message = b"fig1-bench-msg";
     let mut rng = rand::thread_rng();
 
-    // Generate keypairs
+    // Generate keypairs (one per signer)
     let mut sks = Vec::with_capacity(n);
     for _ in 0..n {
         let mut b = [0u8; 64];
@@ -212,36 +214,32 @@ fn bench_frost_signing(n: usize, weights: &[u64], threshold: u64, iters: usize) 
         sks.push(Scalar::from_bytes_mod_order_wide(&b));
     }
 
-    // Select signers
-    let mut active = Vec::new();
-    let mut cum = 0u64;
-    for i in 0..n {
-        if cum >= threshold { break; }
-        active.push(i);
-        cum += weights[i];
-    }
-    let k = active.len();
+    // V-FROST virtualization: signer with weight w_i simulates w_i virtual nodes.
+    // Each virtual node generates its own nonce and partial signature.
+    // Total operations scale with Σw_active = total_active_weight, NOT with k.
+    let num_virtual = total_active_weight as usize;
 
     let mut best = Duration::MAX;
     for _ in 0..iters.min(100) {
         let t0 = Instant::now();
 
-        // Round 1: Generate nonces
-        let mut Ds = Vec::with_capacity(k);
-        let mut Es = Vec::with_capacity(k);
-        for _ in 0..k {
+        // Round 1: each virtual node generates 2 nonces (d, e) → (D, E)
+        for _ in 0..num_virtual {
             let mut b = [0u8; 64];
             rng.fill_bytes(&mut b);
             let d = Scalar::from_bytes_mod_order_wide(&b);
             rng.fill_bytes(&mut b);
             let e = Scalar::from_bytes_mod_order_wide(&b);
-            Ds.push(ED25519_BASEPOINT_TABLE * &d);
-            Es.push(ED25519_BASEPOINT_TABLE * &e);
+            let D = ED25519_BASEPOINT_TABLE * &d;
+            let E = ED25519_BASEPOINT_TABLE * &e;
+            std::hint::black_box((D, E));
         }
 
-        // Round 2: Partial signatures
-        for (idx, &i) in active.iter().enumerate() {
-            let z = sks[i]; // Simplified: in real FROST this involves Lagrange coeffs
+        // Round 2: each virtual node generates 1 partial signature
+        for _ in 0..num_virtual {
+            let mut b = [0u8; 64];
+            rng.fill_bytes(&mut b);
+            let z = Scalar::from_bytes_mod_order_wide(&b);
             std::hint::black_box(z);
         }
 
