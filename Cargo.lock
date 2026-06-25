@@ -935,6 +935,7 @@ dependencies = [
  "solana-client",
  "solana-ed25519-program",
  "solana-sdk",
+ "zk",
 ]
 
 [[package]]
