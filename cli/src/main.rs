@@ -203,8 +203,13 @@ fn generate_zk_proof(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║       WTAS — Weighted Threshold Accountable Signatures      ║");
+    println!("║          Solana DAO Wallet — End-to-End Demo                ║");
+    println!("╚══════════════════════════════════════════════════════════════╝\n");
+
     // ============================================================
-    // Configuration
+    // 0. Configuration
     // ============================================================
     let program_id = Pubkey::from_str("AZiDFQndT4VdW6o4ywME3XHZ81eY2xUtkohULaxC9rwb")?;
     let rpc = RpcClient::new_with_commitment("http://127.0.0.1:8899".to_string(), CommitmentConfig::confirmed());
@@ -220,8 +225,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config_pda, _) = find_config_address(&program_id);
     let (treasury_pda, _) = find_treasury_address(&program_id, &config_pda);
 
+    println!("┌─ Chain Configuration ─────────────────────────────────────┐");
+    println!("│ Program ID : {}", program_id);
+    println!("│ Payer      : {}", payer.pubkey());
+    println!("│ Recipient  : {}", recipient);
+    println!("│ Treasury   : {} (PDA)", treasury_pda);
+    println!("└──────────────────────────────────────────────────────────┘\n");
+
     // ============================================================
-    // Weighted signer setup (n=8, weights [1,2,3,1,2,3,1,2])
+    // 1. Weighted Signer Setup
     // ============================================================
     let n: usize = 8;
     let weights_u64: Vec<u64> = (0..n).map(|i| ((i % 3) + 1) as u64).collect();
@@ -239,8 +251,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    println!("┌─ 1. Weighted Signer Setup ─────────────────────────────────┐");
+    println!("│ Signer count  : n = {n}");
+    println!("│ Weights       : {:?}", weights_u64);
+    println!("│ Total weight  : W_total = {total_weight}");
+    println!("│ Threshold     : t = {threshold}  (> W_total/2)");
+    println!("│ Active signers: k = {select_k}  (randomly selected)");
+    println!("│ Selected IDs  : {:?}", active);
+    for &i in &active {
+        println!("│   Signer[{i}]: weight={}, participates=YES", weights_u64[i]);
+    }
+    for i in 0..n {
+        if !active.contains(&i) {
+            println!("│   Signer[{i}]: weight={}, participates=NO", weights_u64[i]);
+        }
+    }
+    println!("│ Active weight : W_active = {selected_weight}  (≥ t={threshold} ✓)");
+    println!("└──────────────────────────────────────────────────────────┘\n");
+
     // ============================================================
-    // Generate NIZK public parameters + signer keys (dual-curve)
+    // 2. Key Generation (dual-curve)
     // ============================================================
     let mut rng = OsRng;
     let zk_params = ZkParams::new(n, &mut rng);
@@ -249,7 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut signers = Vec::with_capacity(n);
     let mut nonces = Vec::with_capacity(n);
-    for _ in 0..n {
+    for i in 0..n {
         let sk = random_scalar();
         let pk = ED25519_BASEPOINT_TABLE * &sk;
         let sk_ristretto = random_scalar();
@@ -259,16 +289,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         nonces.push(Nonce { r, r_point: ED25519_BASEPOINT_TABLE * &r });
     }
 
+    println!("┌─ 2. Key Generation (dual-curve architecture) ─────────────┐");
+    println!("│ Ed25519 (signing layer):");
+    println!("│   Curve       : Edwards25519  (pairing-free)");
+    println!("│   Key type    : (sk_i, pk_i = sk_i·B)  for each signer");
+    println!("│   Nonce       : (r_i, R_i = r_i·B)  for each signer");
+    println!("│ Ristretto (accountability layer):");
+    println!("│   Curve       : Ristretto  (prime-order, for NIZK)");
+    println!("│   Key type    : (sk'_i, pk'_i = sk'_i·G)  for each signer");
+    println!("│   Tracer key  : (tsk, tpk = tsk·G)  ElGamal keypair");
+    println!("│ NIZK params   : g_vec[{}], h_vec[{}], G, H, B  (SRS)", n, n);
+    println!("└──────────────────────────────────────────────────────────┘\n");
+
     // ============================================================
-    // ZK Proof Generation (off-chain accountability)
+    // 3. Round 1 — Nonce Commitments
     // ============================================================
+    let t_r_agg = Instant::now();
+    let r_agg = active.iter().fold(EdwardsPoint::identity(), |acc, &i| acc + nonces[i].r_point);
+    let dt_r_agg = t_r_agg.elapsed();
+
+    println!("┌─ 3. Round 1 — Nonce Commitments ───────────────────────────┐");
+    println!("│ Each active signer generates:");
+    println!("│   r_i ←$ Z_q,  R_i = r_i·B  (32 bytes each)");
+    for &i in &active {
+        println!("│   Signer[{i}]: R_{{{i}}} = {:02x}..{}",
+            nonces[i].r_point.compress().as_bytes()[0],
+            if weights_u64[i] > 1 { format!("  (w={})", weights_u64[i]) } else { String::new() });
+    }
+    println!("│ Aggregation: R_agg = Σ R_i  ({} signers, {} µs)", active.len(), fmt_us_per(dt_r_agg, active.len()));
+    println!("└──────────────────────────────────────────────────────────┘\n");
+
+    // ============================================================
+    // 4. Weighted Active Public Key
+    // ============================================================
+    let t_pk_agg = Instant::now();
+    let pk_agg = active.iter().fold(EdwardsPoint::identity(), |acc, &i| {
+        acc + signers[i].pk * Scalar::from(weights_u64[i])
+    });
+    let dt_pk_agg = t_pk_agg.elapsed();
+
+    println!("┌─ 4. Active Public Key (weighted) ──────────────────────────┐");
+    println!("│ PK_active = Σ w_i · pk_i");
+    for &i in &active {
+        println!("│   + w_{{{i}}} · pk_{{{i}}}   (w={})", weights_u64[i]);
+    }
+    println!("│ PK_active = {:02x}..  (compressed, 32B)", pk_agg.compress().as_bytes()[0]);
+    println!("└──────────────────────────────────────────────────────────┘\n");
+
+    // ============================================================
+    // 5. NIZK Accountability Proof (generated before signing)
+    // ============================================================
+    println!("┌─ 5. NIZK Accountability Proof (Bulletproofs IPA) ─────────┐");
     let (zk_hash, _zk_proof, zk_prove_us) = generate_zk_proof(
         &zk_params, &tracer_pk, &signers, &active, &weights_u64,
     );
-    println!("ZK Proof: hash={}  prove_time={:.1} µs", hex32(&zk_hash), zk_prove_us);
+    let proof_bytes = _zk_proof.proof_size_bytes();
+    println!("│ Proves knowledge of:");
+    println!("│   (a) b_i ∈ {{0,1}}  — participation bit vector");
+    println!("│   (b) Σ b_i·w_i = {selected_weight}  ≥ t={threshold}  ✓");
+    println!("│   (c) V_i = tpk·r_i + B·b_i  — ElGamal well-formed");
+    println!("│   (d) K_agg = Σ_{{b_i=1}} pk'_i  — consistent with keys");
+    println!("│ Curve      : Ristretto  (IPA folding)");
+    println!("│ Proof size : {proof_bytes} bytes  (O(log n), rounds=log₂{n}={})",
+        (n as f64).log2().ceil() as usize);
+    println!("│ Prove time : {:.1} µs", zk_prove_us);
+    println!("│ zk_hash    : {}  (SHA-256 commitment)", hex32(&zk_hash));
+    println!("└──────────────────────────────────────────────────────────┘\n");
 
     // ============================================================
-    // Build canonical message (includes REAL zk_hash, not [0u8;32])
+    // 6. Canonical Message
     // ============================================================
     let lamports = 1_000_000_000u64;
     let ctx_hash = compute_ctx_hash(&program_id, &config_pda, &treasury_pda, &recipient, lamports, threshold, 0, 1);
@@ -276,21 +365,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let message = build_canonical_message(&treasury_pda, &recipient, lamports, &nonce, &ctx_hash, &zk_hash, &[0u8;32]);
     let (proposal_pda, _) = find_proposal_address(&program_id, &message);
 
-    // ============================================================
-    // WTAS Weighted Signing (Ed25519, w_i factor)
-    // ============================================================
-    let t_r_agg = Instant::now();
-    let r_agg = active.iter().fold(EdwardsPoint::identity(), |acc, &i| acc + nonces[i].r_point);
-    let dt_r_agg = t_r_agg.elapsed();
+    println!("┌─ 6. Canonical Message ────────────────────────────────────┐");
+    println!("│ DAO|treasury={}..", hex32(&treasury_pda.to_bytes()));
+    println!("│     |recipient={}..", hex32(&recipient.to_bytes()));
+    println!("│     |lamports={lamports}|nonce={}..", hex32(&nonce));
+    println!("│     |zk_hash={}  (← NIZK commitment)", hex32(&zk_hash));
+    println!("│ Proposal PDA: {}", proposal_pda);
+    println!("└──────────────────────────────────────────────────────────┘\n");
 
-    // Weighted active PK = Σ w_i * pk_i
-    let t_pk_agg = Instant::now();
-    let pk_agg = active.iter().fold(EdwardsPoint::identity(), |acc, &i| {
-        acc + signers[i].pk * Scalar::from(weights_u64[i])
-    });
-    let dt_pk_agg = t_pk_agg.elapsed();
-
-    // c = H(R_agg || PK_agg || message)
+    // ============================================================
+    // 7. Fiat-Shamir Challenge
+    // ============================================================
     let t_c = Instant::now();
     let mut h = Sha512::new();
     h.update(&compress_edwards(&r_agg));
@@ -300,7 +385,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c = Scalar::from_bytes_mod_order_wide(&wide);
     let dt_c = t_c.elapsed();
 
-    // Partial sigs with WEIGHT: s_i = r_i + c * w_i * sk_i
+    println!("┌─ 7. Fiat-Shamir Challenge ─────────────────────────────────┐");
+    println!("│ c = SHA-512( R_agg || PK_active || message )");
+    println!("│ c = {:02x}..", c.as_bytes()[0]);
+    println!("└──────────────────────────────────────────────────────────┘\n");
+
+    // ============================================================
+    // 8. Round 2 — Weighted Partial Signatures
+    // ============================================================
     let t_sign = Instant::now();
     let mut s_parts: Vec<Scalar> = Vec::with_capacity(active.len());
     for &i in &active {
@@ -312,7 +404,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s_sum = s_parts.iter().cloned().fold(Scalar::ZERO, |acc, si| acc + si);
     let dt_s_agg = t_s_agg.elapsed();
 
-    // Verify locally: s*B == R_agg + PK_active*c
+    println!("┌─ 8. Round 2 — Weighted Partial Signatures ─────────────────┐");
+    println!("│ s_i = r_i + c · w_i · sk_i");
+    for (idx, &i) in active.iter().enumerate() {
+        println!("│   s_{{{i}}} = r_{{{i}}} + c · {} · sk_{{{i}}}", weights_u64[i]);
+    }
+    println!("│ Aggregation: s_agg = Σ s_i  ({} signers)", active.len());
+    println!("│ s_agg = {:02x}..", s_sum.as_bytes()[0]);
+    println!("│ Sign per signer: {}", fmt_us_per(dt_sign_parts, active.len()));
+    println!("└──────────────────────────────────────────────────────────┘\n");
+
+    // ============================================================
+    // 9. Local Verification
+    // ============================================================
     let t_verify = Instant::now();
     let lhs = ED25519_BASEPOINT_TABLE * &s_sum;
     let rhs = r_agg + pk_agg * c;
@@ -321,22 +425,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !verify_ok { panic!("Local weighted signature verification failed"); }
 
-    println!("Performance Summary:");
-    println!("  Agg R_i      : {}", fmt_ms(dt_r_agg));
-    println!("  Agg PK_i (w) : {}", fmt_ms(dt_pk_agg));
-    println!("  Challenge c  : {}", fmt_ms(dt_c));
-    println!("  Sign parts   : {} (avg: {})", fmt_ms(dt_sign_parts), fmt_us_per(dt_sign_parts, active.len()));
-    println!("  Agg s_i      : {}", fmt_ms(dt_s_agg));
-    println!("  Verify agg   : {}", fmt_ms(dt_verify));
+    println!("┌─ 9. Local Verification (Ed25519 equation) ─────────────────┐");
+    println!("│ [s_agg]·B  ≟  R_agg + [c]·PK_active");
+    println!("│ LHS {:02x}..  ≟  RHS {:02x}..", lhs.compress().as_bytes()[0], rhs.compress().as_bytes()[0]);
+    println!("│ Result: {}  ({} µs)", if verify_ok { "✓ MATCH" } else { "✗ FAIL" }, fmt_us_per(dt_verify, 1));
+    println!("│ Final signature: σ = (R_agg, s_agg) = 64 bytes");
+    println!("└──────────────────────────────────────────────────────────┘\n");
 
     let mut sig = [0u8;64];
     sig[..32].copy_from_slice(&compress_edwards(&r_agg));
     sig[32..].copy_from_slice(&s_sum.to_bytes());
     let agg_pk_bytes = compress_edwards(&pk_agg);
+    let (proposal_pda, _) = find_proposal_address(&program_id, &message);
+
+    println!("┌─ 9. On-Chain Canonical Message ────────────────────────────┐");
+    println!("│ DAO|treasury={}..|recipient={}..", hex32(&treasury_pda.to_bytes()), hex32(&recipient.to_bytes()));
+    println!("│     |lamports={lamports}|nonce={}..", hex32(&nonce));
+    println!("│     |zk_hash={}  (← REAL NIZK commitment)", hex32(&zk_hash));
+    println!("│ Proposal PDA : {}", proposal_pda);
+    println!("└──────────────────────────────────────────────────────────┘\n");
 
     // ============================================================
-    // Transaction 1: Initialize + CreateProposal + SetNonceAndChallenge
+    // 10. Transaction 1 — CreateProposal + SetNonceAndChallenge
     // ============================================================
+    println!("┌─ 10. Transaction 1: CreateProposal + SetNonceAndChallenge ─┐");
     let mut ixs1 = Vec::new();
     if match rpc.get_account(&config_pda) { Ok(acc) => acc.owner != program_id, Err(_) => true } {
         ixs1.push(Instruction {
@@ -349,6 +461,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ],
             data: ix::encode_initialize(),
         });
+        println!("│ [ix 0] Initialize  →  create config + treasury PDAs");
     }
 
     let bal = rpc.get_balance(&treasury_pda).unwrap_or(0);
@@ -358,9 +471,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(&payer.pubkey()), &[&payer], rpc.get_latest_blockhash()?
         );
         rpc.send_and_confirm_transaction(&tx)?;
+        println!("│ [fund] {} SOL → treasury", (lamports + 200_000_000) as f64 / 1e9);
     }
 
-    // CreateProposal with REAL zk_hash (not placeholder)
     ixs1.push(Instruction {
         program_id,
         accounts: vec![
@@ -372,6 +485,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
         data: ix::encode_create_proposal(agg_pk_bytes, recipient, lamports, nonce, ctx_hash, zk_hash, [0u8;32], threshold),
     });
+    println!("│ [ix 1] CreateProposal");
+    println!("│   agg_pk   = {}..", hex32(&agg_pk_bytes));
+    println!("│   lamports = {lamports}  ({} SOL)", lamports as f64 / 1e9);
+    println!("│   zk_hash  = {}  (← NIZK proof commitment)", hex32(&zk_hash));
 
     ixs1.push(Instruction {
         program_id,
@@ -383,15 +500,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
         data: ix::encode_set_nonce_challenge(compress_edwards(&r_agg), c.to_bytes()),
     });
+    println!("│ [ix 2] SetNonceAndChallenge");
+    println!("│   r_agg  = {}..", hex32(&compress_edwards(&r_agg)));
+    println!("│   c      = {}..", hex32(&c.to_bytes()));
 
     let sig1 = rpc.send_and_confirm_transaction(
         &Transaction::new_signed_with_payer(&ixs1, Some(&payer.pubkey()), &[&payer], rpc.get_latest_blockhash()?)
     )?;
-    println!("Transaction 1 successful: {}", sig1);
+    println!("│ ✓ Tx1: {}", sig1);
+    println!("└──────────────────────────────────────────────────────────┘\n");
 
     // ============================================================
-    // Transaction 2: Execute Proposal (Solana native Ed25519 verify)
+    // 11. Transaction 2 — Execute Proposal
     // ============================================================
+    println!("┌─ 11. Transaction 2: ExecuteProposal ───────────────────────┐");
     let mut ixs2 = Vec::new();
     let ed_ix = new_ed25519_instruction_with_signature(&message, &sig, &agg_pk_bytes);
     ixs2.push(Instruction {
@@ -402,6 +524,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }).collect(),
         data: ed_ix.data,
     });
+    println!("│ [ix 0] Ed25519SignatureVerify  (Solana native precompile)");
+    println!("│   sig = (R_agg, s_agg)  64 bytes");
+    println!("│   pk  = PK_active        32 bytes");
 
     ixs2.push(Instruction {
         program_id,
@@ -416,14 +541,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
         data: ix::encode_execute_proposal(),
     });
+    println!("│ [ix 1] ExecuteProposal");
+    println!("│   Verify: canonical msg → pk → R  (all match)");
+    println!("│   Transfer: treasury ─{} SOL→ recipient", lamports as f64 / 1e9);
 
     let sig2 = rpc.send_and_confirm_transaction(
         &Transaction::new_signed_with_payer(&ixs2, Some(&payer.pubkey()), &[&payer], rpc.get_latest_blockhash()?)
     )?;
-    println!("Transaction 2 successful: {}", sig2);
+    println!("│ ✓ Tx2: {}", sig2);
+    println!("└──────────────────────────────────────────────────────────┘\n");
 
-    println!("Execution completed: threshold={threshold}, selected_weight={selected_weight}");
-    println!("ZK proof committed on-chain: zk_hash={}", hex32(&zk_hash));
-    println!("Gatekeeper: verify ZK proof off-chain, then sign endorsement if valid");
+    // ============================================================
+    // 12. Summary
+    // ============================================================
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                    EXECUTION COMPLETE                       ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║  Signers   : {active_len}/{n} active, weight {selected_weight}/{total_weight}             ║", active_len = active.len());
+    println!("║  Threshold : {threshold}  (met ✓)                                    ║");
+    println!("║  Signature : valid Ed25519 weighted multi-sig       ║");
+    println!("║  NIZK      : {proof_bytes} bytes, {zk_prove_us:.0} µs prove time          ║", proof_bytes = _zk_proof.proof_size_bytes(), zk_prove_us = zk_prove_us);
+    println!("║  zk_hash   : {}    ║", hex32(&zk_hash));
+    println!("║  Transfer  : treasury → recipient  ({lamports} SOL)       ║", lamports = lamports as f64 / 1e9);
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║  Architecture:                                             ║");
+    println!("║    Signing    → Ed25519 weighted multi-sig (on-chain)      ║");
+    println!("║    ZK Proof   → Bulletproofs IPA on Ristretto (off-chain)  ║");
+    println!("║    Gatekeeper → verifies ZK proof, signs endorsement       ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
     Ok(())
 }
