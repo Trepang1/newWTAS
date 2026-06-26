@@ -481,15 +481,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     sig[..32].copy_from_slice(&compress_edwards(&r_agg));
     sig[32..].copy_from_slice(&s_sum.to_bytes());
     let agg_pk_bytes = compress_edwards(&pk_agg);
-    let (proposal_pda, _) = find_proposal_address(&program_id, &message);
-
-    println!("┌─ 9. On-Chain Canonical Message ────────────────────────────┐");
-    println!("│ DAO|treasury={}..|recipient={}..", hex32(&treasury_pda.to_bytes()), hex32(&recipient.to_bytes()));
-    println!("│     |lamports={lamports}|nonce={}..", hex32(&nonce));
-    println!("│     |zk_hash={}  (← REAL NIZK commitment)", hex32(&zk_hash));
-    println!("│ Proposal PDA : {}", proposal_pda);
-    println!("└──────────────────────────────────────────────────────────┘\n");
-
     // ============================================================
     // 10. Transaction 1 — CreateProposal + SetNonceAndChallenge
     // ============================================================
