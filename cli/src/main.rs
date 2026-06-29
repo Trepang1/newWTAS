@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================================
     // 0. Chain Configuration
     // ============================================================
-    let program_id = Pubkey::from_str("AZiDFQndT4VdW6o4ywME3XHZ81eY2xUtkohULaxC9rwb")?;
+    let program_id = Pubkey::from_str("Aw2LiU4ufNYwDLmSwAKmP1xcMs8vnvTMtPSwkQ5o9WSP")?;
     let rpc = RpcClient::new_with_commitment(
         "http://127.0.0.1:8899".to_string(), CommitmentConfig::confirmed());
 

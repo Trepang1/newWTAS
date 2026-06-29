@@ -14,7 +14,7 @@ use solana_program::{
     sysvar::{self, Sysvar},
 };
 
-solana_program::declare_id!("AZiDFQndT4VdW6o4ywME3XHZ81eY2xUtkohULaxC9rwb");
+solana_program::declare_id!("Aw2LiU4ufNYwDLmSwAKmP1xcMs8vnvTMtPSwkQ5o9WSP");
 
 #[derive(DeriveBorshSerialize, DeriveBorshDeserialize, Debug)]
 pub enum AggIx {
