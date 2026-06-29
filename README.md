@@ -124,17 +124,6 @@ The CLI executes 8 steps:
 WTAS achieves the fastest signing and verification among pairing-free schemes, with
 communication cost 2.1× less than V-FROST and 2× less than TAPS.
 
-## Paper Reference
-
-```bibtex
-@inproceedings{cui2026wtas,
-  title     = {Efficient and Practical Weighted Threshold Signatures for Blockchains},
-  author    = {Jie Cui and Yuhang Liu and Lu Wei and Ru Li and Jing Zhang and Hong Zhong},
-  booktitle = {ESORICS},
-  year      = {2026}
-}
-```
-
 ## Reproducibility
 
 - Use `--release` mode (LTO enabled, single codegen unit)
