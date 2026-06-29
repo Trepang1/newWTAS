@@ -1,139 +1,121 @@
 # WTAS — Weighted Threshold Accountable Signatures
 
-> An efficient, pairing-free weighted threshold signature scheme with signer accountability for blockchains.
+> A pairing-free weighted threshold signature scheme with signer accountability for blockchains.
+> Implemented in Rust with an on-chain Solana DAO wallet demo.
 
-WTAS supports arbitrary weights and thresholds, compresses Zero-Knowledge accountability proofs to O(log n), and resists ROS attacks via a dual-nonce binding mechanism. Implemented in Rust on Solana.
+## Overview
 
-## Protocol Overview
+WTAS is a generic, lightweight, pairing-free Weighted Threshold Accountable Signature scheme. It supports
+arbitrary signer weights and thresholds, compresses accountability proofs to O(log n) via Bulletproofs IPA
+with Super Basis Injection, and defends against ROS attacks through a dual-nonce binding mechanism.
 
-| Phase | Description |
+The protocol produces a standard Ed25519-compatible aggregate signature, enabling native on-chain
+verification via Solana's Ed25519 precompile.
+
+**Key features:**
+- **Weighted thresholds** — arbitrary integer weight per signer
+- **Accountability** — ElGamal encryption on Ristretto with precise post-dispute trace
+- **Anti-ROS** — dual-nonce + binding factors defeat rogue-key and concurrency attacks
+- **Succinct NIZK** — Bulletproofs IPA compresses proof from O(n) to O(log n), transparent setup
+- **Pairing-free** — native compatibility with secp256k1, Ed25519; no trusted setup required
+
+## Protocol
+
+| Phase | What happens |
 |-------|-------------|
 | **Setup** | Generate Ed25519 signing keys + Ristretto ZK keys for N signers with weights |
-| **PSign** | Two-round signing with dual nonces `(r_i, e_i)` and binding factors `ρ_i` |
-| **Combine** | Aggregate partial signatures, generate ElGamal ciphertexts + Bulletproofs NIZK proof |
-| **Verify** | Ed25519 equation check + Combiner endorsement verification |
-| **Trace** | Tracer decrypts ElGamal ciphertexts to identify exact signer set (accountability) |
-
-### Signature Equation
-
-```
-s_i = r_i + e_i·ρ_i + c·w_i·sk_i
-R_eff = Σ(R_i + [ρ_i]E_i)
-[s_agg]·B ≟ R_eff + [c]·K_agg
-```
-Where `c = SHA-512(R_eff || K_agg || msg)` — standard Ed25519 format, on-chain verifiable.
-
-### Key Features
-
-- **Weighted Thresholds**: Each signer has an arbitrary weight `w_i`, threshold `t` in weight units
-- **Accountability**: ElGamal encryption on Ristretto → Tracer can provably identify signers post-dispute
-- **Anti-ROS**: Dual-nonce mechanism with binding factors prevents rogue-key and concurrent attacks
-- **Succinct NIZK**: Bulletproofs IPA with Super Basis Injection compresses proof to O(log n)
-- **Pairing-Free**: Native compatibility with secp256k1 (Bitcoin/Ethereum) and Ed25519 (Solana)
+| **PSign** | Two-round: (1) dual nonces `(r_i, e_i)`, (2) weighted partial sigs `s_i = r_i + e_i·ρ_i + c·w_i·sk_i` |
+| **Combine** | Aggregate sigs, generate ElGamal ciphertexts, produce Bulletproofs NIZK proof |
+| **Verify** | `[s_agg]·B ≟ R_eff + [c]·K_agg` — standard Ed25519 form, on-chain verifiable |
+| **Trace** | Tracer decrypts ElGamal ciphertexts: `M_i = V_i − tsk·U_i`, identifies exact signer set |
 
 ## Repository Structure
 
 ```
-├── schemes/              # Protocol implementations and benchmarks
-│   ├── wtas.rs           # WTAS protocol — dual-nonce signing + ElGamal trace
-│   ├── virtual_frost.rs  # Weighted FROST via virtualization (O(Σw))
-│   ├── wts_das.rs        # WTS Das et al. (BLS12-381, pairing-based)
-│   ├── taps.rs           # TAPS Boneh-Komlo (equal-weight, Sigma NIZK)
-│   ├── schnorr.rs        # Schnorr/BIP-340 baseline
-│   └── pr_taps.rs        # Ed25519 baseline
-├── zk/                   # Bulletproofs NIZK proof system
-│   ├── lib.rs            # Core IPA prover/verifier with Super Basis Injection
-│   └── main.rs           # Proof system demo
+├── schemes/              # Protocol implementations
+│   ├── wtas.rs           # WTAS (our scheme) — dual-nonce + ElGamal trace + NIZK
+│   ├── virtual_frost.rs  # Weighted FROST via virtualization (timing benchmark)
+│   ├── wts_das.rs        # WTS/Das et al. BLS12-381 (timing benchmark)
+│   ├── taps.rs           # TAPS/Boneh-Komlo (timing benchmark)
+│   ├── schnorr.rs        # Schnorr/BIP-340 single-signer baseline
+│   └── pr_taps.rs        # Ed25519 single-signer baseline
+├── zk/                   # Bulletproofs NIZK proof system (prove + 3 verify modes)
 ├── cli/                  # Solana DAO wallet — end-to-end demo
-│   └── main.rs           # Full flow: setup → sign → verify → ZK → trace
-├── time/                 # Fig 1 comprehensive benchmarks
-├── programs/aggtest/     # Solana on-chain program (DAO wallet)
-└── tests/                # TypeScript integration tests
+├── time/                 # Fig 1 comprehensive performance comparison
+├── programs/aggtest/     # Solana on-chain program (DAO wallet with PDA treasury)
+├── tests/                # TypeScript integration tests
+└── ecc_scalar/           # Low-level EC scalar multiplication benchmarks
 ```
 
 ## Quick Start
 
 ### Prerequisites
 - Rust 1.75+ with `cargo`
-- (Optional, for on-chain) Solana CLI + Anchor framework, local test validator
+- (Optional) Solana CLI + Anchor framework, local test validator (for on-chain demo)
 
-### 1. Run All Tests
+### Tests
 
 ```bash
-cargo test --bin schemes --release        # 20 unit tests
-cargo test --lib -p zk --release          # 7 NIZK proof tests
+# 20 unit tests covering setup, sign, verify, trace, weight update, ElGamal
+cargo test --bin schemes --release
+
+# 7 NIZK proof system tests (prove, normal/fast/consistency verify, tamper detection)
+cargo test --lib -p zk --release
 ```
 
-### 2. Full Protocol Benchmark (WTAS)
+### WTAS Full Protocol Benchmark
 
 ```bash
 cargo run --release --bin schemes -- wtas 32 100
 ```
 
-Outputs every protocol phase with timings:
-```
-setup, round1 (dual nonces), coordination (Bctx), round2 (partial sig),
-TOTAL sign, verify, combiner verify, ElGamal enc, NIZK prove,
-NIZK verify, trace (decrypt), weight_update, communication cost
-```
+Outputs every protocol phase: setup, round1 (dual nonces), coordination (Bctx),
+round2 (partial sigs), verify, combiner endorsement verify, ElGamal encryption,
+NIZK prove (µs + bytes), NIZK verify, trace (decrypt), weight update, communication cost.
 
-### 3. Figure 1 — Four-Scheme Comparison
+### Figure 1 — Performance Comparison
 
 ```bash
 cargo run --release --bin time -- fig1 --sizes "8,16,32,64,128" --iters 100
 ```
 
-Compares WTAS vs V-FROST vs WTS/Das vs TAPS across sign/write/verify/communication.
+Outputs CSV comparing WTAS, V-FROST (virtualization), WTS/Das (BLS12-381 pairing),
+and TAPS (equal-weight) across sign, verify, and communication metrics.
 
-### 4. NIZK Proof Demo
-
-```bash
-cargo run --release --bin zk
-```
-
-### 5. On-Chain DAO Wallet Demo
+### On-Chain DAO Wallet Demo
 
 ```bash
-# Terminal 1: Start local Solana validator
+# Terminal 1: start local validator
 solana-test-validator
 
-# Terminal 2: Deploy and run
+# Terminal 2: deploy and run
 anchor deploy
 cargo run --release --bin cli
 ```
 
-The CLI executes the complete flow:
-1. **Setup** — Generate 8 weighted signers
-2. **NIZK Proof** — Bulletproofs IPA (672 bytes, O(log n))
-3. **Canonical Message** — DAO proposal with ZK hash commitment
-4. **Signing** — Dual-nonce protocol + Combiner endorsement σ_C
-5. **Local Verification** — Ed25519 equation + Combiner sig check
-6. **Tx1** — On-chain CreateProposal + SetNonceAndChallenge
-7. **Tx2** — On-chain ExecuteProposal with Ed25519SigVerify precompile
-8. **Accountability Trace** — Tracer decrypts ElGamal ciphertexts, identifies signers
+The CLI executes 8 steps:
+1. Generate 8 weighted signers via WtasGroup
+2. Generate Bulletproofs NIZK proof (672 bytes, O(log n))
+3. Build canonical DAO message with ZK hash commitment
+4. Dual-nonce signing + Combiner endorsement σ_C
+5. Local verification (Ed25519 equation + Combiner sig)
+6. On-chain CreateProposal + fund treasury
+7. On-chain ExecuteProposal with Ed25519 precompile verification
+8. Accountability trace — decrypt ElGamal ciphertexts, output binary participation vector
 
-### 6. Individual Scheme Benchmarks
+## Performance (n=32, 120 total weight)
 
-```bash
-cargo run --release --bin schemes -- wtas 1024 5          # WTAS
-cargo run --release --bin schemes -- virtual_frost 32 100 # Weighted FROST
-cargo run --release --bin schemes -- wts_das 32 50        # WTS Das et al.
-cargo run --release --bin schemes -- taps 32 50           # TAPS Boneh-Komlo
-cargo run --release --bin schemes -- bls 1024 5           # BLS baseline
-```
+| Metric | WTAS | V-FROST | WTS/Das | TAPS |
+|--------|------|---------|---------|------|
+| Sign | **163 µs** | 1,149 µs | 5,001 µs | 320 µs |
+| Verify | **37 µs** | 39 µs | 590 µs | 53 µs |
+| Communication | 2,720 B | 5,760 B | **96 B** | 5,536 B |
+| Proof size | 672 B (O(log n)) | — | — | 3,424 B (O(n)) |
 
-### 7. Low-Level Primitives
-
-```bash
-cargo run --release --bin ecc_scalar -- -n 10000    # EC scalar/pairing
-cargo run --release --bin time -- hash --size 64    # Hash benchmarks
-cargo run --release --bin time -- ed25519           # Ed25519 primitives
-cargo run --release --bin time -- bls --pairing     # BLS12-381 pairings
-```
+WTAS achieves the fastest signing and verification among pairing-free schemes, with
+communication cost 2.1× less than V-FROST and 2× less than TAPS.
 
 ## Paper Reference
-
-If you use this code, please cite:
 
 ```bibtex
 @inproceedings{cui2026wtas,
@@ -146,7 +128,7 @@ If you use this code, please cite:
 
 ## Reproducibility
 
-- Use `--release` mode (LTO enabled)
+- Use `--release` mode (LTO enabled, single codegen unit)
 - Pin CPU frequency: `cpupower frequency-set -g performance` (Linux)
-- Run each benchmark ≥100 iterations
+- Run each benchmark ≥100 iterations, take minimum (as recommended in the paper)
 - Use consistent hardware for comparisons
