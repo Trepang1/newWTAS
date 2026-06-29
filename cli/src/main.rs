@@ -15,6 +15,7 @@
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use solana_client::rpc_client::RpcClient;
+use solana_ed25519_program::new_ed25519_instruction_with_signature;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     hash::hash,
@@ -28,39 +29,9 @@ use rand::RngCore;
 use sha2::{Digest, Sha512};
 
 // WTAS protocol library (dual-nonce signing, combiner endorsement, NIZK, Trace)
-use schemes::wtas::{
-    WtasGroup, WtasFullSignature, ElGamalCiphertext,
-};
+use schemes::wtas::WtasGroup;
 
 /// Manually construct an Ed25519 signature verification instruction
-/// (compatible with Solana 1.18+ runtime ed25519 precompile format).
-fn make_ed25519_verify_ix(message: &[u8], sig: &[u8; 64], pubkey: &[u8; 32]) -> Instruction {
-    let sig_off: u16 = 18;
-    let pk_off: u16 = 18 + 64;
-    let msg_off: u16 = 18 + 64 + 32;
-    let msg_len = message.len() as u16;
-
-    let mut data = Vec::with_capacity(18 + 64 + 32 + message.len());
-    data.push(1u8);        // num_signatures = 1
-    data.extend_from_slice(&[0u8; 3]);  // padding
-    data.extend_from_slice(&sig_off.to_le_bytes());   // sig offset
-    data.extend_from_slice(&0xFFFFu16.to_le_bytes()); // sig ix = inline
-    data.extend_from_slice(&pk_off.to_le_bytes());    // pk offset
-    data.extend_from_slice(&0xFFFFu16.to_le_bytes()); // pk ix = inline
-    data.extend_from_slice(&msg_off.to_le_bytes());   // msg offset
-    data.extend_from_slice(&msg_len.to_le_bytes());   // msg len
-    data.extend_from_slice(&0xFFFFu16.to_le_bytes()); // msg ix = inline
-    data.extend_from_slice(sig);
-    data.extend_from_slice(pubkey);
-    data.extend_from_slice(message);
-
-    Instruction {
-        program_id: solana_sdk::ed25519_program::ID,
-        accounts: vec![],
-        data,
-    }
-}
-
 fn fmt_ms(d: Duration) -> String { format!("{:.3} ms", d.as_secs_f64() * 1e3) }
 fn fmt_us_per(d: Duration, n: usize) -> String {
     if n == 0 { return "-".into(); }
@@ -193,7 +164,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_weight: u64 = weights.iter().sum();
     let threshold: u64 = (total_weight + 1) / 2;
 
-    let mut rng = rand::thread_rng();
     let group = WtasGroup::setup(n, &weights, threshold);
     let (active, selected_weight) = group.select_signers();
 
@@ -216,35 +186,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("└──────────────────────────────────────────────────────────┘\n");
 
     // ============================================================
-    // 2. Signing Protocol (dual-nonce + combiner endorsement)
+    // 2. NIZK Accountability Proof (via WtasGroup)
     // ============================================================
-    let message_raw = b"DAO-transfer-benchmark-msg-0123456789";
+    println!("┌─ 2. NIZK Accountability Proof (Bulletproofs IPA) ─────────┐");
+    let acc_proof = group.prove_accountability(&active);
+    let zk_hash = hash_proof(&acc_proof);
 
-    println!("┌─ 2. Signing Protocol (dual-nonce, anti-ROS) ──────────────┐");
+    println!("│ Curve       : Ristretto  (prime-order, pairing-free)");
+    println!("│ Protocol    : Bulletproofs IPA + Super Basis Injection");
+    println!("│ Rounds      : log₂({n}) = {}", (n as f64).log2().ceil() as usize);
+    println!("│ Proof size  : {} bytes  (O(log n))", acc_proof.proof_bytes);
+    println!("│ Prove time  : {:.0} µs", acc_proof.prove_us);
+    println!("│");
+    println!("│ Statement proved:");
+    println!("│   b_i ∈ {{0,1}}, Σ b_i·w_i = {selected_weight} ≥ t={threshold} ✓");
+    println!("│   ElGamal ciphertexts well-formed, K_agg consistent");
+    println!("└──────────────────────────────────────────────────────────┘\n");
+
+    // ============================================================
+    // 3. Canonical Message (includes zk_hash — must match on-chain)
+    // ============================================================
+    let lamports = 1_000_000_000u64;
+    let ctx_hash = compute_ctx_hash(
+        &program_id, &config_pda, &treasury_pda, &recipient, lamports, threshold, 0, 1);
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let message = build_canonical_message(
+        &treasury_pda, &recipient, lamports, &nonce, &ctx_hash, &zk_hash, &[0u8;32]);
+    let (proposal_pda, _) = find_proposal_address(&program_id, &message);
+
+    println!("┌─ 3. Canonical Message ────────────────────────────────────┐");
+    println!("│ DAO|treasury={}..", hex32(&treasury_pda.to_bytes()));
+    println!("│     |recipient={}..", hex32(&recipient.to_bytes()));
+    println!("│     |lamports={lamports}|nonce={}..", hex32(&nonce));
+    println!("│     |zk_hash={}..", hex32(&zk_hash));
+    println!("│ Proposal PDA: {}", proposal_pda);
+    println!("└──────────────────────────────────────────────────────────┘\n");
+
+    // ============================================================
+    // 4. Signing Protocol (signs the canonical message)
+    // ============================================================
+    println!("┌─ 4. Signing Protocol (dual-nonce, anti-ROS) ──────────────┐");
     let t_sign = Instant::now();
-    let (full_sig, dt_r1, dt_bctx, dt_r2, _) = group.sign(&active, message_raw);
+    let (full_sig, dt_r1, dt_bctx, dt_r2, _) = group.sign(&active, &message);
     let total_sign = t_sign.elapsed();
 
     println!("│ Round 1  (dual nonces) : {}", fmt_ms(dt_r1));
     println!("│ Coord    (bind ctx)    : {}", fmt_ms(dt_bctx));
     println!("│ Round 2  (partial sig) : {}", fmt_ms(dt_r2));
     println!("│ Total signing time     : {}", fmt_ms(total_sign));
-    println!("│");
-    println!("│ Signature components:");
-    println!("│   R_eff  = {:02x}..  (effective agg commitment)", full_sig.sig.r_agg.compress().as_bytes()[0]);
-    println!("│   s_agg  = {:02x}..  (aggregated scalar)", full_sig.sig.s_agg.as_bytes()[0]);
-    println!("│   σ_C    = {:02x}..  (combiner endorsement, 64B)", full_sig.combiner_sig[0]);
+    println!("│ R_eff = {:02x}.., s_agg = {:02x}.., σ_C = {:02x}..",
+        full_sig.sig.r_agg.compress().as_bytes()[0],
+        full_sig.sig.s_agg.as_bytes()[0],
+        full_sig.combiner_sig[0]);
     println!("└──────────────────────────────────────────────────────────┘\n");
 
     // ============================================================
-    // 3. Local Verification
+    // 5. Local Verification
     // ============================================================
-    println!("┌─ 3. Local Verification ───────────────────────────────────┐");
-    let (verify_ok, dt_verify) = group.verify(&full_sig, &active, message_raw);
+    println!("┌─ 5. Local Verification ───────────────────────────────────┐");
+    let (verify_ok, dt_verify) = group.verify(&full_sig, &active, &message);
     println!("│ EdDSA check : [s]B ≟ R_eff + [c]K_agg  → {}", if verify_ok { "✓" } else { "✗" });
     println!("│ Combiner check: σ_C valid for (m,R_eff,S,K_agg) → {}",
         WtasGroup::verify_combiner_endorsement(
-            &full_sig.combiner_pk, message_raw,
+            &full_sig.combiner_pk, &message,
             &full_sig.sig.r_agg, &group.active_group_pk(&active),
             &full_sig.sig.s_agg, &full_sig.combiner_sig,
         ).then(|| "✓").unwrap_or("✗"));
@@ -262,51 +267,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pk = group.active_group_pk(&active);
         pk.compress().to_bytes()
     };
-
-    // ============================================================
-    // 4. NIZK Accountability Proof (via WtasGroup)
-    // ============================================================
-    println!("┌─ 4. NIZK Accountability Proof (Bulletproofs IPA) ─────────┐");
-    let acc_proof = group.prove_accountability(&active);
-    let zk_hash = hash_proof(&acc_proof);
-
-    println!("│ Curve       : Ristretto  (prime-order, pairing-free)");
-    println!("│ Protocol    : Bulletproofs IPA + Super Basis Injection");
-    println!("│ Rounds      : log₂({n}) = {}", (n as f64).log2().ceil() as usize);
-    println!("│ Proof size  : {} bytes  (O(log n))", acc_proof.proof_bytes);
-    println!("│ Prove time  : {:.0} µs", acc_proof.prove_us);
-    println!("│");
-    println!("│ Statement proved:");
-    println!("│   (a) b_i ∈ {{0,1}}  ∀i");
-    println!("│   (b) Σ b_i·w_i = {selected_weight} ≥ t={threshold} ✓");
-    println!("│   (c) V_i = tpk·r_i + B·b_i  (ElGamal well-formed)");
-    println!("│   (d) K_agg consistent with participant keys");
-    println!("│");
-    println!("│ On-chain commitment:");
-    println!("│   zk_hash = SHA-512( WTAS_NIZK || c_w || A || S || T1 || T2 )");
-    println!("│   zk_hash = {}..", hex32(&zk_hash));
-    println!("│   (proof stored off-chain, hash committed on-chain)");
-    println!("└──────────────────────────────────────────────────────────┘\n");
-
-    // ============================================================
-    // 5. Canonical Message
-    // ============================================================
-    let lamports = 1_000_000_000u64;
-    let ctx_hash = compute_ctx_hash(
-        &program_id, &config_pda, &treasury_pda, &recipient, lamports, threshold, 0, 1);
-    let mut nonce = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let message = build_canonical_message(
-        &treasury_pda, &recipient, lamports, &nonce, &ctx_hash, &zk_hash, &[0u8;32]);
-    let (proposal_pda, _) = find_proposal_address(&program_id, &message);
-
-    println!("┌─ 5. Canonical Message ────────────────────────────────────┐");
-    println!("│ DAO|treasury={}..", hex32(&treasury_pda.to_bytes()));
-    println!("│     |recipient={}..", hex32(&recipient.to_bytes()));
-    println!("│     |lamports={lamports}|nonce={}..", hex32(&nonce));
-    println!("│     |zk_hash={}  (← NIZK commitment)", hex32(&zk_hash));
-    println!("│ Proposal PDA: {}", proposal_pda);
-    println!("└──────────────────────────────────────────────────────────┘\n");
 
     // ============================================================
     // 6. Transaction 1 — Initialize + CreateProposal + SetNonce
@@ -359,13 +319,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let r_eff_bytes = full_sig.sig.r_agg.compress().to_bytes();
     // Challenge is embedded in the binding context; for on-chain we store R_eff
     let c_bytes = {
-        // Reconstruct challenge for on-chain SetNonce
+        // c = SHA-512(R_eff || K_agg || message) — matches Ed25519 precompile
         let k_agg = group.active_group_pk(&active);
         let mut h = Sha512::new();
-        h.update(b"WTAS_challenge");
         h.update(&r_eff_bytes);
         h.update(k_agg.compress().as_bytes());
-        h.update(message_raw);
+        h.update(&message);
         let mut wide = [0u8; 64];
         wide.copy_from_slice(&h.finalize());
         curve25519_dalek::scalar::Scalar::from_bytes_mod_order_wide(&wide).to_bytes()
@@ -397,8 +356,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================================
     println!("┌─ 7. Transaction 2: ExecuteProposal ───────────────────────┐");
     let mut ixs2 = Vec::new();
-    let ed_ix = make_ed25519_verify_ix(&message, &sig_bytes, &agg_pk_bytes);
-    ixs2.push(ed_ix);
+    let ed_ix = new_ed25519_instruction_with_signature(&message, &sig_bytes, &agg_pk_bytes);
+    ixs2.push(Instruction {
+        program_id: Pubkey::new_from_array(ed_ix.program_id.to_bytes()),
+        accounts: ed_ix.accounts.into_iter().map(|m| AccountMeta {
+            pubkey: Pubkey::new_from_array(m.pubkey.to_bytes()),
+            is_signer: m.is_signer, is_writable: m.is_writable,
+        }).collect(),
+        data: ed_ix.data,
+    });
     println!("│ [ix 0] Ed25519SignatureVerify  (Solana native precompile)");
     println!("│   sig = (R_eff, s_agg)  64 bytes");
     println!("│   pk  = K_agg           32 bytes");
@@ -437,15 +403,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dt_trace = t_trace.elapsed();
     let trace_ok = group.trace_and_verify(&elgamal_cts, &active);
 
-    println!("│ Tracer decrypts ElGamal ciphertexts:");
-    println!("│   For each i: M_i = V_i - tsk·U_i");
-    println!("│   M_i == B  →  b_i = 1 (participated)");
-    println!("│   M_i == O  →  b_i = 0 (absent)");
+    println!("│ Tracer holds tsk (secret tracing key).");
+    println!("│ For each signer i, tracer computes:  M_i = V_i − tsk · U_i");
+    println!("│   If M_i = B  →  b_i = 1  (signer participated)");
+    println!("│   If M_i = O  →  b_i = 0  (signer absent)");
     println!("│");
-    println!("│ Traced signers : {:?}  (expected: {:?})", traced, active);
-    println!("│ Trace match    : {}", if trace_ok { "✓" } else { "✗" });
-    println!("│ Trace time     : {}  ({})", fmt_ms(dt_trace), fmt_us_per(dt_trace, n));
-    println!("│ Ciphertexts    : {} × (U,V) = {} bytes", n, n * 64);
+    println!("│ Signer │ Weight │ Actual │ Traced │ Verdict");
+    println!("│ ───────┼────────┼────────┼────────┼───────");
+    for i in 0..n {
+        let actual = if active.contains(&i) { "YES" } else { " NO" };
+        let traced_b = if traced.contains(&i) { "YES" } else { " NO" };
+        let verdict = if actual == traced_b { "✓" } else { "✗ MISMATCH" };
+        println!("│   {i}    │   {w:<4} │  {actual}  │  {traced_b}  │  {verdict}",
+            i = i, w = weights[i]);
+    }
+    println!("│ ───────┴────────┴────────┴────────┴───────");
+    print!("│ Trace vector : ");
+    for i in 0..n {
+        print!("{} ", if traced.contains(&i) { 1 } else { 0 });
+    }
+    println!();
+    let actual_vec: Vec<u8> = (0..n).map(|i| if active.contains(&i) { 1 } else { 0 }).collect();
+    print!("│ Actual vector: ");
+    for v in &actual_vec { print!("{v} "); }
+    println!();
+    println!("│ Overall match : {}", if trace_ok { "✓ ALL CORRECT" } else { "✗ ERROR" });
+    println!("│ Trace time   : {}  ({}/signer)", fmt_ms(dt_trace), fmt_us_per(dt_trace, n));
+    println!("│ Ciphertexts  : {} × (U,V) = {} bytes  (stored on-chain)", n, n * 64);
     println!("└──────────────────────────────────────────────────────────┘\n");
 
     // ============================================================

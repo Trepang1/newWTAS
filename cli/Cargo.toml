@@ -12,7 +12,7 @@ solana-sdk = "2.0.2"
 hex = "0.4"
 borsh = "0.10.4"
 borsh-derive = "0.10.4"
-# solana-ed25519-program removed — manually constructing Ed25519 verify instruction for compatibility
+solana-ed25519-program = "3.0.0"
 ed25519-dalek = "1.0"
 anyhow = "1"
 bs58 = "0.5"

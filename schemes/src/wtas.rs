@@ -31,20 +31,6 @@ fn random_scalar() -> Scalar {
 }
 
 // ============================================================
-// Helper: hash to scalar (Fiat-Shamir challenge)
-// ============================================================
-fn hash_to_scalar(domain: &[u8], r: &CompressedEdwardsY, pk: &CompressedEdwardsY, msg: &[u8]) -> Scalar {
-    let mut h = Sha512::new();
-    h.update(domain);
-    h.update(r.as_bytes());
-    h.update(pk.as_bytes());
-    h.update(msg);
-    let mut wide = [0u8; 64];
-    wide.copy_from_slice(&h.finalize());
-    Scalar::from_bytes_mod_order_wide(&wide)
-}
-
-// ============================================================
 // Benchmark output helper
 // ============================================================
 fn fmt_rate(op: &str, total: Duration, iters: usize) {
@@ -238,7 +224,6 @@ impl WtasGroup {
     pub fn make_binding_context(
         &self, active: &[usize], nonces: &[DualNonce], message: &[u8],
     ) -> BindingContext {
-        let k = active.len();
         // Collect per-signer info for Bctx serialization
         let entries: Vec<(usize, EdwardsPoint, EdwardsPoint, u64, EdwardsPoint)> = active.iter()
             .zip(nonces.iter())
@@ -271,10 +256,9 @@ impl WtasGroup {
             .map(|&(_, _, _, wj, pkj)| pkj * Scalar::from(wj))
             .sum();
 
-        // c = H2(R_eff, K_agg, m)
+        // c = SHA-512(R_eff || K_agg || m) — standard Ed25519, matches precompile
         let challenge = {
             let mut h = Sha512::new();
-            h.update(b"WTAS_challenge");
             h.update(r_eff.compress().as_bytes());
             h.update(k_agg.compress().as_bytes());
             h.update(message);
@@ -440,10 +424,10 @@ impl WtasGroup {
         let t0 = Instant::now();
 
         // Compute K_agg and challenge from public inputs
+        // c = SHA-512(R_eff || K_agg || m) — standard Ed25519, matches precompile
         let k_agg = self.active_group_pk(active);
         let c = {
             let mut h = Sha512::new();
-            h.update(b"WTAS_challenge");
             h.update(sig.r_agg.compress().as_bytes());
             h.update(k_agg.compress().as_bytes());
             h.update(message);
