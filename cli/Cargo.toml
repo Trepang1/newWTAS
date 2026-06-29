@@ -19,3 +19,6 @@ bs58 = "0.5"
 
 # NIZK proof system (our crate)
 zk = { path = "../zk" }
+
+# WTAS protocol library (our crate, dual-nonce signing + Trace)
+schemes = { path = "../schemes" }

@@ -73,6 +73,14 @@ pub struct WtasSigner {
     pub pk_ristretto: RistrettoPoint,
 }
 
+/// ElGamal ciphertext pair (U, V) on Ristretto.
+/// U = r·G, V = r·tracer_pk + b·B
+#[derive(Clone, Debug)]
+pub struct ElGamalCiphertext {
+    pub u: RistrettoPoint,
+    pub v: RistrettoPoint,
+}
+
 /// WTAS accountability proof (NIZK proof + associated data).
 pub struct WtasAccountabilityProof {
     pub zk_proof: WTAPSProof,
@@ -88,6 +96,9 @@ pub struct WtasGroup {
     pub threshold: u64,
     pub signers: Vec<WtasSigner>,
     pub group_pk: EdwardsPoint,       // Σ w_i * pk_i  (Ed25519)
+    // Combiner keys — untrusted coordinator (Ed25519)
+    pub combiner_sk: Scalar,
+    pub combiner_pk: EdwardsPoint,
     // Tracer keys — Ristretto-based ElGamal for accountability
     pub tracer_sk: Scalar,
     pub tracer_pk: RistrettoPoint,
@@ -101,6 +112,39 @@ pub struct WtasGroup {
 pub struct WtasSignature {
     pub r_agg: EdwardsPoint,    // Σ R_i
     pub s_agg: Scalar,          // Σ s_i
+}
+
+/// Dual nonce pair: (r_i, e_i) with commitments (R_i, E_i).
+/// r_i = deterministic nonce, e_i = ephemeral blinding nonce (anti-ROS).
+#[derive(Clone, Debug)]
+pub struct DualNonce {
+    pub r: Scalar,
+    pub r_point: EdwardsPoint,
+    pub e: Scalar,
+    pub e_point: EdwardsPoint,
+}
+
+/// Binding context constructed by the Combiner during coordination.
+/// Bctx = (j, R_j, E_j, w_j)_{j∈J} plus precomputed aggregates.
+#[derive(Clone, Debug)]
+pub struct BindingContext {
+    /// Per-signer entries: (id, R_j, E_j, w_j, pk_j)
+    pub entries: Vec<(usize, EdwardsPoint, EdwardsPoint, u64, EdwardsPoint)>,
+    /// Binding factors ρ_j = H1(j, m, Bctx) for each j∈J
+    pub binding_factors: Vec<Scalar>,
+    /// Effective aggregate commitment: R_eff = Σ(R_j + [ρ_j]E_j)
+    pub r_eff: EdwardsPoint,
+    /// Weighted aggregate public key: K_agg = Σ[w_j]pk_j
+    pub k_agg: EdwardsPoint,
+    /// Fiat-Shamir challenge: c = H2(R_eff, K_agg, m)
+    pub challenge: Scalar,
+}
+
+/// Full WTAS signature including combiner endorsement.
+pub struct WtasFullSignature {
+    pub sig: WtasSignature,
+    pub combiner_sig: [u8; 64],    // Ed25519 combiner endorsement
+    pub combiner_pk: EdwardsPoint, // combiner public key
 }
 
 impl WtasGroup {
@@ -133,13 +177,17 @@ impl WtasGroup {
             group_pk += s.pk * Scalar::from(s.weight);
         }
 
+        // Combiner keys on Ed25519 (untrusted coordinator)
+        let combiner_sk = random_scalar();
+        let combiner_pk = ED25519_BASEPOINT_TABLE * &combiner_sk;
+
         // Tracer keys on Ristretto (for ElGamal)
         let tracer_sk = random_scalar();
         let tracer_pk = zk_params.G * tracer_sk;
 
         WtasGroup {
             n, weights: weights.to_vec(), total_weight, threshold,
-            signers, group_pk, tracer_sk, tracer_pk, zk_params,
+            signers, group_pk, combiner_sk, combiner_pk, tracer_sk, tracer_pk, zk_params,
         }
     }
 
@@ -156,78 +204,219 @@ impl WtasGroup {
     }
 
     // ============================================================
-    // Round 1: Each active signer generates a nonce commitment
+    // Round 1: Each active signer generates dual nonces (r_i, e_i)
+    //   r_i — deterministic nonce (from sk_i, prevents key leakage)
+    //   e_i — ephemeral blinding nonce (anti-ROS, fresh per session)
     // ============================================================
-    pub fn round1_nonces(&self, active: &[usize]) -> (Vec<Scalar>, Vec<EdwardsPoint>) {
+    pub fn round1_dual_nonces(&self, active: &[usize], message: &[u8]) -> Vec<DualNonce> {
         let mut nonces = Vec::with_capacity(active.len());
-        let mut commitments = Vec::with_capacity(active.len());
         for &i in active {
-            let r = random_scalar();
-            let R = ED25519_BASEPOINT_TABLE * &r;
-            nonces.push(r);
-            commitments.push(R);
+            let signer = &self.signers[i];
+            // Deterministic nonce: r_i = H(HR(sk_i), m)
+            let r = {
+                let mut h = Sha512::new();
+                h.update(b"WTAS_nonce_r");
+                h.update(signer.sk.as_bytes());
+                h.update(message);
+                let mut wide = [0u8; 64];
+                wide.copy_from_slice(&h.finalize());
+                Scalar::from_bytes_mod_order_wide(&wide)
+            };
+            let r_point = ED25519_BASEPOINT_TABLE * &r;
+            // Ephemeral blinding nonce: e_i ←$ Z_q
+            let e = random_scalar();
+            let e_point = ED25519_BASEPOINT_TABLE * &e;
+            nonces.push(DualNonce { r, r_point, e, e_point });
         }
-        (nonces, commitments)
+        nonces
     }
 
     // ============================================================
-    // Round 2: Each active signer produces a partial signature
+    // Combiner coordination: construct binding context Bctx and
+    // compute effective aggregate commitment R_eff.
+    // ============================================================
+    pub fn make_binding_context(
+        &self, active: &[usize], nonces: &[DualNonce], message: &[u8],
+    ) -> BindingContext {
+        let k = active.len();
+        // Collect per-signer info for Bctx serialization
+        let entries: Vec<(usize, EdwardsPoint, EdwardsPoint, u64, EdwardsPoint)> = active.iter()
+            .zip(nonces.iter())
+            .map(|(&i, dn)| (i, dn.r_point, dn.e_point, self.weights[i], self.signers[i].pk))
+            .collect();
+
+        // Compute binding factors ρ_j = H1(j, m, Bctx_entries)
+        let binding_factors: Vec<Scalar> = entries.iter().map(|&(id, rj, ej, wj, pkj)| {
+            let mut h = Sha512::new();
+            h.update(b"WTAS_binding");
+            h.update(&id.to_le_bytes());
+            h.update(message);
+            h.update(rj.compress().as_bytes());
+            h.update(ej.compress().as_bytes());
+            h.update(&wj.to_le_bytes());
+            h.update(pkj.compress().as_bytes());
+            let mut wide = [0u8; 64];
+            wide.copy_from_slice(&h.finalize());
+            Scalar::from_bytes_mod_order_wide(&wide)
+        }).collect();
+
+        // R_eff = Σ(R_j + [ρ_j]E_j)
+        let r_eff: EdwardsPoint = entries.iter()
+            .zip(binding_factors.iter())
+            .map(|(&(_, rj, ej, _, _), rho)| rj + ej * rho)
+            .sum();
+
+        // K_agg = Σ[w_j]pk_j
+        let k_agg: EdwardsPoint = entries.iter()
+            .map(|&(_, _, _, wj, pkj)| pkj * Scalar::from(wj))
+            .sum();
+
+        // c = H2(R_eff, K_agg, m)
+        let challenge = {
+            let mut h = Sha512::new();
+            h.update(b"WTAS_challenge");
+            h.update(r_eff.compress().as_bytes());
+            h.update(k_agg.compress().as_bytes());
+            h.update(message);
+            let mut wide = [0u8; 64];
+            wide.copy_from_slice(&h.finalize());
+            Scalar::from_bytes_mod_order_wide(&wide)
+        };
+
+        BindingContext { entries, binding_factors, r_eff, k_agg, challenge }
+    }
+
+    // ============================================================
+    // Round 2: Each active signer produces a weighted partial sig
+    //   s_i = r_i + e_i·ρ_i + c·w_i·sk_i   (mod q)
     // ============================================================
     pub fn round2_partial_sign(
-        &self,
-        active: &[usize],
-        nonces: &[Scalar],
-        r_agg: &EdwardsPoint,
-        message: &[u8],
+        &self, nonces: &[DualNonce], bctx: &BindingContext,
     ) -> Vec<Scalar> {
-        let active_pk = self.active_group_pk(active);
-        let c = hash_to_scalar(
-            b"WTAS_challenge",
-            &r_agg.compress(),
-            &active_pk.compress(),
-            message,
-        );
-
-        let mut partials = Vec::with_capacity(active.len());
-        for (idx, &i) in active.iter().enumerate() {
+        let mut partials = Vec::with_capacity(nonces.len());
+        for (idx, (dn, rho)) in nonces.iter().zip(bctx.binding_factors.iter()).enumerate() {
+            let i = bctx.entries[idx].0;
             let signer = &self.signers[i];
-            // s_i = r_i + c * w_i * sk_i
-            let s_i = nonces[idx] + c * Scalar::from(signer.weight) * signer.sk;
+            // s_i = r_i + e_i·ρ_i + c·w_i·sk_i
+            let s_i = dn.r + dn.e * rho + bctx.challenge * Scalar::from(signer.weight) * signer.sk;
             partials.push(s_i);
         }
         partials
     }
 
     // ============================================================
-    // Full signing protocol (both rounds + aggregation)
+    // Full signing protocol (dual-nonce, both rounds + aggregation)
     // ============================================================
     pub fn sign(
         &self,
         active: &[usize],
         message: &[u8],
-    ) -> (WtasSignature, Duration, Duration, Duration) {
-        // Round 1
+    ) -> (WtasFullSignature, Duration, Duration, Duration, Duration) {
+        // Round 1: dual nonces
         let t1 = Instant::now();
-        let (nonces, commitments) = self.round1_nonces(active);
+        let nonces = self.round1_dual_nonces(active, message);
         let dt_round1 = t1.elapsed();
 
-        // Aggregate R = Σ R_i
-        let t_agg = Instant::now();
-        let mut r_agg = EdwardsPoint::default();
-        for R in &commitments {
-            r_agg += R;
-        }
-        let dt_agg = t_agg.elapsed();
+        // Combiner coordination: build binding context
+        let t_bctx = Instant::now();
+        let bctx = self.make_binding_context(active, &nonces, message);
+        let dt_bctx = t_bctx.elapsed();
 
-        // Round 2
+        // Round 2: weighted partial signatures with binding
         let t2 = Instant::now();
-        let partials = self.round2_partial_sign(active, &nonces, &r_agg, message);
+        let partials = self.round2_partial_sign(&nonces, &bctx);
         let dt_round2 = t2.elapsed();
 
         // Aggregate s = Σ s_i
         let s_agg: Scalar = partials.into_iter().sum();
 
-        (WtasSignature { r_agg, s_agg }, dt_round1, dt_agg, dt_round2)
+        // Combiner endorsement: σ_C = EdSign(sk_c, (m, R_eff, S_agg, K_agg))
+        let combiner_sig = self.combiner_endorse(message, &bctx, &s_agg);
+
+        (WtasFullSignature {
+            sig: WtasSignature { r_agg: bctx.r_eff, s_agg },
+            combiner_sig,
+            combiner_pk: self.combiner_pk,
+        }, dt_round1, dt_bctx, dt_round2, Duration::ZERO)
+    }
+
+    /// Combiner endorsement: signs the aggregate payload with its Ed25519 key.
+    pub fn combiner_endorse(
+        &self, message: &[u8], bctx: &BindingContext, s_agg: &Scalar,
+    ) -> [u8; 64] {
+        // Build endorsement message: H(m || R_eff || S || K_agg)
+        let mut h = Sha512::new();
+        h.update(b"WTAS_combiner");
+        h.update(message);
+        h.update(bctx.r_eff.compress().as_bytes());
+        h.update(s_agg.as_bytes());
+        h.update(bctx.k_agg.compress().as_bytes());
+        let digest = h.finalize();
+
+        // Ed25519 Schnorr-like signing with our keys
+        let k = random_scalar();
+        let big_r = ED25519_BASEPOINT_TABLE * &k;
+        let c = {
+            let mut h2 = Sha512::new();
+            h2.update(b"WTAS_combiner_challenge");
+            h2.update(big_r.compress().as_bytes());
+            h2.update(self.combiner_pk.compress().as_bytes());
+            h2.update(&digest);
+            let mut wide = [0u8; 64];
+            wide.copy_from_slice(&h2.finalize());
+            Scalar::from_bytes_mod_order_wide(&wide)
+        };
+        let s = k + c * self.combiner_sk;
+
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(big_r.compress().as_bytes());
+        sig[32..].copy_from_slice(s.as_bytes());
+        sig
+    }
+
+    /// Verify combiner endorsement on payload (m, R_eff, S, K_agg).
+    pub fn verify_combiner_endorsement(
+        combiner_pk: &EdwardsPoint, message: &[u8],
+        r_eff: &EdwardsPoint, k_agg: &EdwardsPoint,
+        s_agg: &Scalar, combiner_sig: &[u8; 64],
+    ) -> bool {
+        let big_r = match CompressedEdwardsY::from_slice(&combiner_sig[..32]) {
+            Ok(compressed) => match compressed.decompress() {
+                Some(p) => p, None => return false,
+            },
+            Err(_) => return false,
+        };
+        let s_bytes: [u8; 32] = {
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&combiner_sig[32..64]);
+            b
+        };
+        let s = match Scalar::from_canonical_bytes(s_bytes).into() {
+            Some(sc) => sc, None => return false,
+        };
+
+        let mut h = Sha512::new();
+        h.update(b"WTAS_combiner");
+        h.update(message);
+        h.update(r_eff.compress().as_bytes());
+        h.update(s_agg.as_bytes());
+        h.update(k_agg.compress().as_bytes());
+        let digest = h.finalize();
+
+        let c = {
+            let mut h2 = Sha512::new();
+            h2.update(b"WTAS_combiner_challenge");
+            h2.update(big_r.compress().as_bytes());
+            h2.update(combiner_pk.compress().as_bytes());
+            h2.update(&digest);
+            let mut wide = [0u8; 64];
+            wide.copy_from_slice(&h2.finalize());
+            Scalar::from_bytes_mod_order_wide(&wide)
+        };
+
+        let lhs = ED25519_BASEPOINT_TABLE * &s;
+        let rhs = big_r + combiner_pk * c;
+        lhs.compress() == rhs.compress()
     }
 
     // ============================================================
@@ -242,46 +431,116 @@ impl WtasGroup {
     }
 
     // ============================================================
-    // Verification: s * B == R + c * PK_active
-    //   where PK_active = Σ_{i∈active} w_i * pk_i
+    // Verification: [s]B == R_eff + [c]K_agg
+    //   where K_agg = Σ_{i∈active} w_i · pk_i
+    //   c = H2(R_eff, K_agg, m)  — derived from public values only
     // ============================================================
-    pub fn verify(&self, sig: &WtasSignature, active: &[usize], message: &[u8]) -> (bool, Duration) {
-        let active_pk = self.active_group_pk(active);
+    pub fn verify(&self, full_sig: &WtasFullSignature, active: &[usize], message: &[u8]) -> (bool, Duration) {
+        let sig = &full_sig.sig;
+        let t0 = Instant::now();
 
-        let c = hash_to_scalar(
-            b"WTAS_challenge",
-            &sig.r_agg.compress(),
-            &active_pk.compress(),
-            message,
-        );
+        // Compute K_agg and challenge from public inputs
+        let k_agg = self.active_group_pk(active);
+        let c = {
+            let mut h = Sha512::new();
+            h.update(b"WTAS_challenge");
+            h.update(sig.r_agg.compress().as_bytes());
+            h.update(k_agg.compress().as_bytes());
+            h.update(message);
+            let mut wide = [0u8; 64];
+            wide.copy_from_slice(&h.finalize());
+            Scalar::from_bytes_mod_order_wide(&wide)
+        };
 
+        // 1. Verify core EdDSA equation: [s]B == R_eff + [c]K_agg
+        let lhs = ED25519_BASEPOINT_TABLE * &sig.s_agg;
+        let rhs = sig.r_agg + k_agg * c;
+        if lhs.compress() != rhs.compress() {
+            return (false, t0.elapsed());
+        }
+
+        // 2. Verify combiner endorsement on (m, R_eff, s_agg, K_agg)
+        if !Self::verify_combiner_endorsement(
+            &full_sig.combiner_pk, message, &sig.r_agg, &k_agg,
+            &sig.s_agg, &full_sig.combiner_sig,
+        ) {
+            return (false, t0.elapsed());
+        }
+
+        (true, t0.elapsed())
+    }
+
+    /// Verify signature with pre-computed binding context (for benchmarks).
+    pub fn verify_with_bctx(&self, sig: &WtasSignature, bctx: &BindingContext) -> (bool, Duration) {
         let t0 = Instant::now();
         let lhs = ED25519_BASEPOINT_TABLE * &sig.s_agg;
-        let rhs = sig.r_agg + active_pk * c;
+        let rhs = sig.r_agg + bctx.k_agg * bctx.challenge;
         let ok = lhs.compress() == rhs.compress();
         (ok, t0.elapsed())
     }
 
     // ============================================================
     // ElGamal encryption for accountability (Ristretto-based)
-    // V_i = r_enc,i * tracer_pk + b_i * B
+    // C_i = (U_i, V_i) where:
+    //   U_i = r_enc,i · G
+    //   V_i = r_enc,i · tracer_pk + b_i · B
     // Returns: (ciphertexts, r_enc vector, b vector)
     // ============================================================
     pub fn encrypt_participation_ristretto(
         &self, active: &[usize],
-    ) -> (Vec<RistrettoPoint>, Vec<Scalar>, Vec<Scalar>) {
+    ) -> (Vec<ElGamalCiphertext>, Vec<Scalar>, Vec<Scalar>) {
         let mut cts = Vec::with_capacity(self.n);
         let mut r_enc_vec = Vec::with_capacity(self.n);
         let mut b_vec = Vec::with_capacity(self.n);
         for i in 0..self.n {
             let b_i = if active.contains(&i) { Scalar::ONE } else { Scalar::ZERO };
             let r_enc = random_scalar();
+            let u_i = self.zk_params.G * r_enc;
             let v_i = self.tracer_pk * r_enc + self.zk_params.B * b_i;
-            cts.push(v_i);
+            cts.push(ElGamalCiphertext { u: u_i, v: v_i });
             r_enc_vec.push(r_enc);
             b_vec.push(b_i);
         }
         (cts, r_enc_vec, b_vec)
+    }
+
+    /// Get just the V_i values from ciphertexts (for NIZK proof input).
+    pub fn ciphertexts_v_only(cts: &[ElGamalCiphertext]) -> Vec<RistrettoPoint> {
+        cts.iter().map(|c| c.v).collect()
+    }
+
+    // ============================================================
+    // Trace: decrypt ElGamal ciphertexts to identify active signers.
+    // For each i: compute M_i = V_i - tsk · U_i
+    //   If M_i == B → b_i = 1 (participated)
+    //   If M_i == O → b_i = 0 (absent)
+    // ============================================================
+    pub fn trace(
+        &self, cts: &[ElGamalCiphertext],
+    ) -> Vec<usize> {
+        let mut active_signers = Vec::new();
+        for i in 0..self.n {
+            let m_i = cts[i].v - cts[i].u * self.tracer_sk;
+            if m_i == self.zk_params.B {
+                active_signers.push(i);
+            } else if m_i != RistrettoPoint::identity() {
+                // Ciphertext is malformed — skip this signer
+                continue;
+            }
+        }
+        active_signers
+    }
+
+    /// Trace and verify: compare trace result with expected active set.
+    pub fn trace_and_verify(
+        &self, cts: &[ElGamalCiphertext], expected: &[usize],
+    ) -> bool {
+        let traced = self.trace(cts);
+        if traced.len() != expected.len() { return false; }
+        for &i in expected {
+            if !traced.contains(&i) { return false; }
+        }
+        true
     }
 
     /// Legacy Ed25519-based ElGamal (kept for backward compat tests).
@@ -303,7 +562,8 @@ impl WtasGroup {
     pub fn prove_accountability(
         &self, active: &[usize],
     ) -> WtasAccountabilityProof {
-        let (ciphertexts_v, r_enc_vec, b_vec) = self.encrypt_participation_ristretto(active);
+        let (ciphertexts, r_enc_vec, b_vec) = self.encrypt_participation_ristretto(active);
+        let ciphertexts_v = Self::ciphertexts_v_only(&ciphertexts);
 
         // Ristretto participant keys (one per signer, for all n signers)
         let participant_keys: Vec<RistrettoPoint> = self.signers.iter()
@@ -363,7 +623,8 @@ impl WtasGroup {
     pub fn verify_accountability(
         &self, active: &[usize], proof: &WtasAccountabilityProof,
     ) -> (bool, Duration) {
-        let (ciphertexts_v, _r_enc, b_vec) = self.encrypt_participation_ristretto(active);
+        let (ciphertexts, _r_enc, b_vec) = self.encrypt_participation_ristretto(active);
+        let ciphertexts_v = Self::ciphertexts_v_only(&ciphertexts);
 
         let participant_keys: Vec<RistrettoPoint> = self.signers.iter()
             .map(|s| s.pk_ristretto).collect();
@@ -475,27 +736,43 @@ pub fn bench_wtas_full(num_signers: usize, iters: usize) {
     // Sign
     let mut best_round1 = Duration::MAX;
     let mut best_round2 = Duration::MAX;
-    let mut best_agg = Duration::MAX;
+    let mut best_bctx = Duration::MAX;
     for _ in 0..iters {
-        let (sig, dt1, dt_agg, dt2) = group.sign(&active, message);
+        let (sig, dt1, dt_bctx, dt2, _) = group.sign(&active, message);
         best_round1 = best_round1.min(dt1);
-        best_agg = best_agg.min(dt_agg);
+        best_bctx = best_bctx.min(dt_bctx);
         best_round2 = best_round2.min(dt2);
         std::hint::black_box(&sig);
     }
-    fmt_rate("round1 (nonces)", best_round1, k);
+    fmt_rate("round1 (dual nonces)", best_round1, k);
+    fmt_rate("coordination (Bctx)", best_bctx, k);
     fmt_rate("round2 (partial sig)", best_round2, k);
-    let total_sign = best_round1 + best_round2 + best_agg;
+    let total_sign = best_round1 + best_round2 + best_bctx;
     fmt_rate("TOTAL sign", total_sign, 1);
 
     // Verify
-    let (sig, _, _, _) = group.sign(&active, message);
+    let (sig, _, _, _, _) = group.sign(&active, message);
     let mut best_verify = Duration::MAX;
     for _ in 0..iters {
         let (ok, dt) = group.verify(&sig, &active, message);
         if ok { best_verify = best_verify.min(dt); }
     }
     fmt_rate("verify", best_verify, 1);
+
+    // Combiner endorsement
+    let k_agg = group.active_group_pk(&active);
+    let mut best_combine = Duration::MAX;
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        let ok = WtasGroup::verify_combiner_endorsement(
+            &sig.combiner_pk, message,
+            &sig.sig.r_agg, &k_agg,
+            &sig.sig.s_agg, &sig.combiner_sig,
+        );
+        best_combine = best_combine.min(t0.elapsed());
+        std::hint::black_box(&ok);
+    }
+    fmt_rate("combiner verify", best_combine, 1);
 
     // ElGamal encryption (Ristretto)
     let mut best_enc = Duration::MAX;
@@ -519,6 +796,21 @@ pub fn bench_wtas_full(num_signers: usize, iters: usize) {
         if ok { best_zk_verify = best_zk_verify.min(dt); }
     }
     fmt_rate("NIZK verify", best_zk_verify, 1);
+
+    // Trace: decrypt ElGamal ciphertexts to identify signers
+    let (trace_cts, _, _) = group.encrypt_participation_ristretto(&active);
+    let mut best_trace = Duration::MAX;
+    for _ in 0..iters.min(50) {
+        let t0 = Instant::now();
+        let traced = group.trace(&trace_cts);
+        best_trace = best_trace.min(t0.elapsed());
+        std::hint::black_box(&traced);
+    }
+    fmt_rate("trace (decrypt)", best_trace, num_signers);
+    let traced = group.trace(&trace_cts);
+    let trace_ok = group.trace_and_verify(&trace_cts, &active);
+    println!("Trace result: {} signers identified, match={}",
+        traced.len(), if trace_ok { "✓" } else { "✗" });
 
     // Weight update
     let mut best_update = Duration::MAX;
@@ -580,28 +872,18 @@ mod tests {
         let g = WtasGroup::setup(1, &w, 1);
         let msg = b"test";
 
-        // Known keys
-        let sk = g.signers[0].sk;
-        let pk: EdwardsPoint = ED25519_BASEPOINT_TABLE * &sk;
-        let w1 = Scalar::from(1u64);
-        // group_pk = w1 * pk = pk (since w1=1)
-        eprintln!("pk == group_pk: {}", pk.compress() == g.group_pk.compress());
-
-        // Manual sign
-        let r = random_scalar();
-        let R: EdwardsPoint = ED25519_BASEPOINT_TABLE * &r;
-        let c = hash_to_scalar(b"WTAS_challenge", &R.compress(), &g.group_pk.compress(), msg);
-        let s = r + c * w1 * sk;
-
-        // Verify
-        let lhs: EdwardsPoint = ED25519_BASEPOINT_TABLE * &s;
-        let rhs = R + g.group_pk * c;
-        eprintln!("single signer verify: {}", lhs.compress() == rhs.compress());
-
-        // API sign
-        let (sig, _, _, _) = g.sign(&[0], msg);
-        let (ok, _) = g.verify(&sig, &[0], msg);
+        // API sign with full dual-nonce protocol
+        let (full_sig, _, _, _, _) = g.sign(&[0], msg);
+        let (ok, _) = g.verify(&full_sig, &[0], msg);
         assert!(ok, "sig verification failed");
+
+        // Verify combiner endorsement
+        let k_agg = g.active_group_pk(&[0]);
+        assert!(WtasGroup::verify_combiner_endorsement(
+            &full_sig.combiner_pk, msg,
+            &full_sig.sig.r_agg, &k_agg,
+            &full_sig.sig.s_agg, &full_sig.combiner_sig,
+        ), "combiner sig invalid");
     }
 
     #[test]
@@ -609,8 +891,8 @@ mod tests {
         let w = vec![1, 1];
         let g = WtasGroup::setup(2, &w, 1);
         let (active, _) = g.select_signers();
-        let (sig, _, _, _) = g.sign(&active, b"hello");
-        let (ok, _) = g.verify(&sig, &active, b"wrong");
+        let (full_sig, _, _, _, _) = g.sign(&active, b"hello");
+        let (ok, _) = g.verify(&full_sig, &active, b"wrong");
         assert!(!ok);
     }
 
@@ -646,25 +928,60 @@ mod tests {
         assert_eq!(cts.len(), 4); // one per signer (active + inactive)
     }
 
+    #[test]
+    fn test_trace_decrypt_identifies_active_signers() {
+        let w = vec![1, 2, 3, 4];
+        let g = WtasGroup::setup(4, &w, 6);
+        let active = vec![0, 1, 2]; // weight 1+2+3=6 ≥ 6
+        let (cts, _, _) = g.encrypt_participation_ristretto(&active);
+        let traced = g.trace(&cts);
+        assert_eq!(traced.len(), active.len());
+        for i in &active {
+            assert!(traced.contains(i), "Signer {i} should be traced as active");
+        }
+    }
+
+    #[test]
+    fn test_trace_all_active() {
+        let w = vec![1, 1, 1, 1];
+        let g = WtasGroup::setup(4, &w, 4);
+        let active = vec![0, 1, 2, 3];
+        let (cts, _, _) = g.encrypt_participation_ristretto(&active);
+        assert!(g.trace_and_verify(&cts, &active));
+    }
+
+    #[test]
+    fn test_trace_none_active() {
+        let w = vec![1, 1, 1, 1];
+        let g = WtasGroup::setup(4, &w, 1);
+        let active: Vec<usize> = vec![];
+        let (cts, _, _) = g.encrypt_participation_ristretto(&active);
+        let traced = g.trace(&cts);
+        assert!(traced.is_empty());
+    }
+
+    #[test]
+    fn test_trace_does_not_include_inactive() {
+        let w = vec![1, 2, 3, 4, 5];
+        let g = WtasGroup::setup(5, &w, 4);
+        let active = vec![0, 3]; // weight 1+4=5 ≥ 4
+        let (cts, _, _) = g.encrypt_participation_ristretto(&active);
+        let traced = g.trace(&cts);
+        // signers 1, 2, 4 should NOT be in traced
+        for &inactive in &[1, 2, 4] {
+            assert!(!traced.contains(&inactive),
+                "Signer {inactive} should NOT be traced as active");
+        }
+    }
+
+    /// Manual end-to-end verification using full dual-nonce protocol.
     fn manual_sign_verify(g: &WtasGroup, active: &[usize], msg: &[u8]) -> bool {
-        let k = active.len();
-        let mut nonces = Vec::with_capacity(k);
-        let mut commitments = Vec::with_capacity(k);
-        for _ in 0..k {
-            let r = random_scalar();
-            commitments.push(ED25519_BASEPOINT_TABLE * &r);
-            nonces.push(r);
-        }
-        let mut r_agg = EdwardsPoint::default();
-        for R in &commitments { r_agg += R; }
-        let active_pk = g.active_group_pk(active);
-        let c = hash_to_scalar(b"WTAS_challenge", &r_agg.compress(), &active_pk.compress(), msg);
-        let mut s_agg = Scalar::ZERO;
-        for (idx, &i) in active.iter().enumerate() {
-            s_agg += nonces[idx] + c * Scalar::from(g.weights[i]) * g.signers[i].sk;
-        }
+        let nonces = g.round1_dual_nonces(active, msg);
+        let bctx = g.make_binding_context(active, &nonces, msg);
+        let partials = g.round2_partial_sign(&nonces, &bctx);
+        let s_agg: Scalar = partials.into_iter().sum();
         let lhs: EdwardsPoint = ED25519_BASEPOINT_TABLE * &s_agg;
-        let rhs = r_agg + active_pk * c;
+        let rhs = bctx.r_eff + bctx.k_agg * bctx.challenge;
         lhs.compress() == rhs.compress()
     }
 
@@ -678,13 +995,29 @@ mod tests {
             let (active, _) = g.select_signers();
             let msg = b"test";
 
-            // Manual verification
+            // Manual verification with dual-nonce protocol
             assert!(manual_sign_verify(&g, &active, msg), "manual n={n} k={}", active.len());
 
             // API
-            let (sig, _, _, _) = g.sign(&active, msg);
-            let (ok, _) = g.verify(&sig, &active, msg);
+            let (full_sig, _, _, _, _) = g.sign(&active, msg);
+            let (ok, _) = g.verify(&full_sig, &active, msg);
             assert!(ok, "API n={n} k={}", active.len());
         }
+    }
+
+    #[test]
+    fn test_combiner_endorsement_rejects_wrong_key() {
+        let w = vec![1, 2, 3];
+        let g = WtasGroup::setup(3, &w, 5);
+        let msg = b"test";
+        let (full_sig, _, _, _, _) = g.sign(&[0, 1, 2], msg);
+        // Use a wrong combiner public key
+        let wrong_pk = ED25519_BASEPOINT_TABLE * &random_scalar();
+        let k_agg = g.active_group_pk(&[0, 1, 2]);
+        assert!(!WtasGroup::verify_combiner_endorsement(
+            &wrong_pk, msg,
+            &full_sig.sig.r_agg, &k_agg,
+            &full_sig.sig.s_agg, &full_sig.combiner_sig,
+        ));
     }
 }

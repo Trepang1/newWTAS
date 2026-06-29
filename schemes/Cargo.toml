@@ -3,6 +3,10 @@ name = "schemes"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "schemes"
+path = "src/lib.rs"
+
 [dependencies]
 blst = "0.3"
 rand = "0.8"
