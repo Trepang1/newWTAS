@@ -72,6 +72,8 @@ pub struct WtasAccountabilityProof {
     pub zk_proof: WTAPSProof,
     pub proof_bytes: usize,
     pub prove_us: f64,
+    /// Ciphertext V values used during proof generation (for verification reproducibility)
+    pub ciphertexts_v: Vec<RistrettoPoint>,
 }
 
 /// WTAS Group — full protocol state with dual-curve architecture.
@@ -574,6 +576,7 @@ impl WtasGroup {
         );
 
         let w_total = Scalar::from(self.total_weight);
+        let cts_for_proof = ciphertexts_v.clone();
 
         let public = PublicInput {
             ciphertexts_v,
@@ -598,7 +601,7 @@ impl WtasGroup {
         let prove_us = t0.elapsed().as_secs_f64() * 1e6;
         let proof_bytes = zk_proof.proof_size_bytes();
 
-        WtasAccountabilityProof { zk_proof, proof_bytes, prove_us }
+        WtasAccountabilityProof { zk_proof, proof_bytes, prove_us, ciphertexts_v: cts_for_proof }
     }
 
     // ============================================================
@@ -607,8 +610,7 @@ impl WtasGroup {
     pub fn verify_accountability(
         &self, active: &[usize], proof: &WtasAccountabilityProof,
     ) -> (bool, Duration) {
-        let (ciphertexts, _r_enc, b_vec) = self.encrypt_participation_ristretto(active);
-        let ciphertexts_v = Self::ciphertexts_v_only(&ciphertexts);
+        let ciphertexts_v = proof.ciphertexts_v.clone();
 
         let participant_keys: Vec<RistrettoPoint> = self.signers.iter()
             .map(|s| s.pk_ristretto).collect();
@@ -618,13 +620,16 @@ impl WtasGroup {
             k_agg += self.signers[i].pk_ristretto;
         }
 
+        // Build b_vec from active set (used in prover to compute t = Σ b_i·w_i)
         let w_scalars: Vec<Scalar> = self.weights.iter().map(|w| Scalar::from(*w)).collect();
+        let mut b_vec = vec![Scalar::ZERO; self.n];
+        for &i in active { b_vec[i] = Scalar::ONE; }
         let mut t = Scalar::ZERO;
         for i in 0..self.n {
             t += b_vec[i] * w_scalars[i];
         }
 
-        let rho_w = random_scalar(); // Not needed for verify — verifier recomputes c_w
+        let rho_w = random_scalar();
         let c_w = RistrettoPoint::multiscalar_mul(
             std::iter::once(&rho_w).chain(w_scalars.iter()),
             std::iter::once(&self.zk_params.H).chain(self.zk_params.h_vec.iter()),
