@@ -15,7 +15,6 @@
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use solana_client::rpc_client::RpcClient;
-use solana_ed25519_program::new_ed25519_instruction_with_signature;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     hash::hash,
@@ -32,6 +31,35 @@ use sha2::{Digest, Sha512};
 use schemes::wtas::{
     WtasGroup, WtasFullSignature, ElGamalCiphertext,
 };
+
+/// Manually construct an Ed25519 signature verification instruction
+/// (compatible with Solana 1.18+ runtime ed25519 precompile format).
+fn make_ed25519_verify_ix(message: &[u8], sig: &[u8; 64], pubkey: &[u8; 32]) -> Instruction {
+    let sig_off: u16 = 18;
+    let pk_off: u16 = 18 + 64;
+    let msg_off: u16 = 18 + 64 + 32;
+    let msg_len = message.len() as u16;
+
+    let mut data = Vec::with_capacity(18 + 64 + 32 + message.len());
+    data.push(1u8);        // num_signatures = 1
+    data.extend_from_slice(&[0u8; 3]);  // padding
+    data.extend_from_slice(&sig_off.to_le_bytes());   // sig offset
+    data.extend_from_slice(&0xFFFFu16.to_le_bytes()); // sig ix = inline
+    data.extend_from_slice(&pk_off.to_le_bytes());    // pk offset
+    data.extend_from_slice(&0xFFFFu16.to_le_bytes()); // pk ix = inline
+    data.extend_from_slice(&msg_off.to_le_bytes());   // msg offset
+    data.extend_from_slice(&msg_len.to_le_bytes());   // msg len
+    data.extend_from_slice(&0xFFFFu16.to_le_bytes()); // msg ix = inline
+    data.extend_from_slice(sig);
+    data.extend_from_slice(pubkey);
+    data.extend_from_slice(message);
+
+    Instruction {
+        program_id: solana_sdk::ed25519_program::ID,
+        accounts: vec![],
+        data,
+    }
+}
 
 fn fmt_ms(d: Duration) -> String { format!("{:.3} ms", d.as_secs_f64() * 1e3) }
 fn fmt_us_per(d: Duration, n: usize) -> String {
@@ -369,15 +397,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================================
     println!("┌─ 7. Transaction 2: ExecuteProposal ───────────────────────┐");
     let mut ixs2 = Vec::new();
-    let ed_ix = new_ed25519_instruction_with_signature(&message, &sig_bytes, &agg_pk_bytes);
-    ixs2.push(Instruction {
-        program_id: Pubkey::new_from_array(ed_ix.program_id.to_bytes()),
-        accounts: ed_ix.accounts.into_iter().map(|m| AccountMeta {
-            pubkey: Pubkey::new_from_array(m.pubkey.to_bytes()),
-            is_signer: m.is_signer, is_writable: m.is_writable,
-        }).collect(),
-        data: ed_ix.data,
-    });
+    let ed_ix = make_ed25519_verify_ix(&message, &sig_bytes, &agg_pk_bytes);
+    ixs2.push(ed_ix);
     println!("│ [ix 0] Ed25519SignatureVerify  (Solana native precompile)");
     println!("│   sig = (R_eff, s_agg)  64 bytes");
     println!("│   pk  = K_agg           32 bytes");
