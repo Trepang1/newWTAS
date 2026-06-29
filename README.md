@@ -82,6 +82,15 @@ cargo run --release --bin time -- fig1 --sizes "8,16,32,64,128" --iters 100
 Outputs CSV comparing WTAS, V-FROST (virtualization), WTS/Das (BLS12-381 pairing),
 and TAPS (equal-weight) across sign, verify, and communication metrics.
 
+### NIZK Proof System Demo
+
+```bash
+cargo run --release --bin zk_demo
+```
+
+Runs a standalone Bulletproofs IPA prove/verify demo (n=8). Outputs proof size
+and verifies correctness via three methods: iterative folding, fast path, and consistency check.
+
 ### On-Chain DAO Wallet Demo
 
 ```bash
